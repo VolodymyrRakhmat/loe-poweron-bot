@@ -40,14 +40,15 @@ PORT = int(os.getenv("PORT", "0"))  # якщо хостинг дає PORT (Rende
 CACHE_BUST = os.getenv("CACHE_BUST", "1") == "1"
 GROUPS = ["1.1", "1.2", "2.1", "2.2", "3.1", "3.2", "4.1", "4.2", "5.1", "5.2", "6.1", "6.2"]
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))  # фіксований інтервал перевірки сайту, с
-REMINDER_MINUTES_BEFORE = int(os.getenv("REMINDER_MINUTES_BEFORE", "15"))
+CHECK_INTERVAL = max(15, int(os.getenv("CHECK_INTERVAL", "30")))  # інтервал перевірки сайту, с (не менше 15)
+REMINDER_MINUTES_BEFORE = int(os.getenv("REMINDER_MINUTES_BEFORE", "15"))  # за замовчуванням для нових чатів
+LEAD_OPTIONS = (5, 10, 15)  # кнопки «за скільки хвилин сповіщати»
 REMIND_END = os.getenv("REMIND_END", "1") == "1"            # нагадувати і про те, що світло скоро зʼявиться
 
 # закріплення графіка в групових чатах
 PIN_SCHEDULE = os.getenv("PIN_SCHEDULE", "1") == "1"        # закріплювати свіжий графік
 REPLACE_OLD = os.getenv("REPLACE_OLD", "1") == "1"          # видаляти стару версію картинки цього ж дня
-DELETE_EXPIRED = os.getenv("DELETE_EXPIRED", "0") == "1"    # видаляти (а не лише відкріплювати) вчорашні картинки
+DELETE_EXPIRED = os.getenv("DELETE_EXPIRED", "1") == "1"    # видаляти (а не лише відкріплювати) вчорашні картинки
 
 # щоденні зведення
 DIGESTS = os.getenv("DIGESTS", "0") == "1"                 # за замовчуванням ВИМКНЕНО: публікуємо лише коли графік змінився на сайті
@@ -99,6 +100,14 @@ def init_db():
             CREATE TABLE IF NOT EXISTS sent_reminders (
                 reminder_key TEXT PRIMARY KEY,
                 sent_at TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                chat_id INTEGER PRIMARY KEY,
+                notify INTEGER NOT NULL DEFAULT 1,
+                lead INTEGER NOT NULL DEFAULT 15,
+                pin INTEGER NOT NULL DEFAULT 1
             )
         """)
 
@@ -180,6 +189,34 @@ def delete_pin_row(chat_id: int, day: str):
 def get_all_pins() -> list[tuple[int, str, int]]:
     with db() as conn:
         return conn.execute("SELECT chat_id, day, message_id FROM pinned_messages").fetchall()
+
+
+def get_chat_pins(chat_id: int) -> list[tuple[str, int]]:
+    with db() as conn:
+        return conn.execute(
+            "SELECT day, message_id FROM pinned_messages WHERE chat_id = ?", (chat_id,)
+        ).fetchall()
+
+
+def get_settings(chat_id: int) -> dict:
+    """Налаштування чату: сповіщати так/ні, за скільки хвилин, закріплювати так/ні."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT notify, lead, pin FROM chat_settings WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+    if not row:
+        return {"notify": True, "lead": REMINDER_MINUTES_BEFORE, "pin": True}
+    return {"notify": bool(row[0]), "lead": int(row[1]), "pin": bool(row[2])}
+
+
+def update_setting(chat_id: int, **changes):
+    cfg = get_settings(chat_id)
+    cfg.update(changes)
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO chat_settings (chat_id, notify, lead, pin) VALUES (?, ?, ?, ?)",
+            (chat_id, int(cfg["notify"]), int(cfg["lead"]), int(cfg["pin"])),
+        )
 
 
 def get_saved_schedule(group_name: str) -> dict | None:
@@ -327,9 +364,9 @@ def sorted_days(days) -> list[str]:
 
 
 def upcoming_days(all_days, limit: int = 2) -> list[str]:
-    """Сьогодні та завтра (дати порівнюються як дати, а не як рядки)."""
-    res = [d for d in sorted_days(all_days) if is_actual(d)]
-    return res[:limit] or sorted_days(all_days)[-1:]
+    """Сьогодні та завтра (дати порівнюються як дати, а не як рядки).
+    Минулих днів не повертає: якщо актуального графіка нема — порожній список (мовчимо)."""
+    return [d for d in sorted_days(all_days) if is_actual(d)][:limit]
 
 
 def resolve_day(snapshot: dict, offset: int) -> str | None:
@@ -421,6 +458,8 @@ def format_personal_message(group_name: str, data: dict, is_update: bool = False
     lines = [title]
 
     for day, info in data.get("days", {}).items():
+        if not is_actual(day):
+            continue
         lines.append(f"📅 <b>{pretty_day(day)}</b>")
         intervals = info.get("intervals", [])
         if intervals:
@@ -449,6 +488,8 @@ def format_chat_message(group_name: str, new_data: dict, old_data: dict | None =
             lines.append("")
 
     for day, info in new_data.get("days", {}).items():
+        if not is_actual(day):
+            continue
         intervals = info.get("intervals", [])
         count = len(intervals)
         total_min = calc_duration_minutes(intervals)
@@ -470,6 +511,7 @@ def get_groups_keyboard() -> InlineKeyboardMarkup:
     for i in range(0, len(GROUPS), 4):
         row = [InlineKeyboardButton(text=f"Черга {g}", callback_data=f"set_grp:{g}") for g in GROUPS[i:i + 4]]
         rows.append(row)
+    rows.append([InlineKeyboardButton(text="⚙️ Налаштування сповіщень", callback_data="cfg:open")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -671,20 +713,21 @@ async def safe_send_photo(chat_id: int, png: bytes, caption: str) -> bool:
     return await send_msg(chat_id, png, caption) is not None
 
 
-async def pin_replace(chat_id: int, day: str, new_id: int):
-    """Закріплює нове повідомлення, а старе (цього ж дня) відкріплює й за потреби видаляє."""
+async def track_and_pin(chat_id: int, day: str, new_id: int, pin: bool):
+    """Запам'ятовує свіжу картинку дня, за потреби закріплює її, а стару (цього ж дня) відкріплює й видаляє."""
     old_id = get_pin(chat_id, day)
-    try:
-        await bot.pin_chat_message(chat_id, new_id, disable_notification=True)
-    except TelegramAPIError as e:
-        logging.warning(f"Не вдалось закріпити в {chat_id}: {e} (потрібні права адміна «Закріплення повідомлень»)")
-        return
+    if pin:
+        try:
+            await bot.pin_chat_message(chat_id, new_id, disable_notification=True)
+        except TelegramAPIError as e:
+            logging.warning(f"Не вдалось закріпити в {chat_id}: {e} (потрібні права адміна «Закріплення повідомлень»)")
     set_pin(chat_id, day, new_id)
     if old_id and old_id != new_id:
-        try:
-            await bot.unpin_chat_message(chat_id, message_id=old_id)
-        except TelegramAPIError:
-            pass
+        if PIN_SCHEDULE:
+            try:
+                await bot.unpin_chat_message(chat_id, message_id=old_id)
+            except TelegramAPIError:
+                pass
         if REPLACE_OLD:
             try:
                 await bot.delete_message(chat_id, old_id)
@@ -692,14 +735,35 @@ async def pin_replace(chat_id: int, day: str, new_id: int):
                 logging.info(f"Не вдалось видалити стару картинку {old_id} в {chat_id}: {e}")
 
 
-async def publish(chat_id: int, day: str, png: bytes | None, text: str, pin: bool = True, silent: bool = False) -> bool:
-    """Надсилає картинку/текст на день і (для груп) закріплює її замість попередньої."""
+async def publish(chat_id: int, day: str, png: bytes | None, text: str,
+                  managed: bool = False, silent: bool = False, force_pin: bool = False) -> bool:
+    """Надсилає картинку/текст на день.
+    managed=True — повідомлення «кероване»: запам'ятовуємо його, стару версію цього дня видаляємо,
+    закріплюємо, якщо в чаті ввімкнено закріплення (force_pin — закріпити незалежно від налаштування)."""
     msg = await send_msg(chat_id, png, text, silent=silent)
     if msg is None:
         return False
-    if pin and PIN_SCHEDULE:
-        await pin_replace(chat_id, day, msg.message_id)
+    if managed or force_pin:
+        pin = PIN_SCHEDULE and (force_pin or get_settings(chat_id)["pin"])
+        await track_and_pin(chat_id, day, msg.message_id, pin)
     return True
+
+
+async def apply_pin_setting(chat_id: int, enable: bool):
+    """Кнопка «Закріплювати»: одразу закріплює/відкріплює актуальні картинки цього чату."""
+    if not PIN_SCHEDULE:
+        return
+    for day, msg_id in get_chat_pins(chat_id):
+        d = parse_day(day)
+        if d is not None and d < date.today():
+            continue
+        try:
+            if enable:
+                await bot.pin_chat_message(chat_id, msg_id, disable_notification=True)
+            else:
+                await bot.unpin_chat_message(chat_id, message_id=msg_id)
+        except TelegramAPIError as e:
+            logging.info(f"Не вдалось змінити закріплення {msg_id} в {chat_id}: {e}")
 
 
 async def expire_old_pins():
@@ -775,7 +839,7 @@ async def broadcast_to_group_chats(changed_by_day: dict, olds: dict, new_days: s
         for day in days:
             kind = "new" if day in new_days else "update"
             caption = build_caption(snapshot, day, focus=focus, changed=changed_by_day[day], olds=olds, kind=kind)
-            await publish(chat_id, day, pngs.get(day), caption, pin=True)
+            await publish(chat_id, day, pngs.get(day), caption, managed=True)
             await asyncio.sleep(0.1)  # не впиратись у ліміти Telegram
 
 
@@ -800,32 +864,38 @@ async def reminders_loop():
                 if not subscribers:
                     continue
 
-                lead = timedelta(minutes=REMINDER_MINUTES_BEFORE)
-                for start, end in outage_spans(saved):
-                    # перед вимкненням
-                    if start - lead <= now < start:
-                        left = max(1, round((start - now).total_seconds() / 60))
-                        text = (
-                            f"⏳ <b>Увага! Через {left} хв вимкнення світла</b>\n"
-                            f"Черга: <b>{grp}</b>\n"
-                            f"Інтервал: <code>{start.strftime('%H:%M')}–{end.strftime('%H:%M')}</code>"
-                        )
-                        for chat_id, _ in subscribers:
-                            key = f"{chat_id}:{grp}:start:{start:%Y%m%d%H%M}"
-                            if not was_reminder_sent(key) and await safe_send(chat_id, text):
-                                mark_reminder_sent(key)
+                spans = outage_spans(saved)
+                for chat_id, _ in subscribers:
+                    cfg = get_settings(chat_id)
+                    if not cfg["notify"]:
+                        continue
+                    lead = timedelta(minutes=cfg["lead"])
 
-                    # перед поверненням світла
-                    if REMIND_END and end - lead <= now < end and start < now:
-                        left = max(1, round((end - now).total_seconds() / 60))
-                        text = (
-                            f"💡 <b>Світло має зʼявитись приблизно через {left} хв</b>\n"
-                            f"Черга: <b>{grp}</b> · очікується о <code>{end.strftime('%H:%M')}</code>"
-                        )
-                        for chat_id, _ in subscribers:
+                    for start, end in spans:
+                        # перед вимкненням
+                        if start - lead <= now < start:
+                            key = f"{chat_id}:{grp}:start:{start:%Y%m%d%H%M}"
+                            if not was_reminder_sent(key):
+                                left = max(1, round((start - now).total_seconds() / 60))
+                                text = (
+                                    f"⏳ <b>Увага! Через {left} хв вимкнення світла</b>\n"
+                                    f"Черга: <b>{grp}</b>\n"
+                                    f"Інтервал: <code>{start.strftime('%H:%M')}–{end.strftime('%H:%M')}</code>"
+                                )
+                                if await safe_send(chat_id, text):
+                                    mark_reminder_sent(key)
+
+                        # перед поверненням світла
+                        if REMIND_END and start < now and end - lead <= now < end:
                             key = f"{chat_id}:{grp}:end:{end:%Y%m%d%H%M}"
-                            if not was_reminder_sent(key) and await safe_send(chat_id, text):
-                                mark_reminder_sent(key)
+                            if not was_reminder_sent(key):
+                                left = max(1, round((end - now).total_seconds() / 60))
+                                text = (
+                                    f"💡 <b>Світло має зʼявитись приблизно через {left} хв</b>\n"
+                                    f"Черга: <b>{grp}</b> · очікується о <code>{end.strftime('%H:%M')}</code>"
+                                )
+                                if await safe_send(chat_id, text):
+                                    mark_reminder_sent(key)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -850,14 +920,14 @@ async def send_digest(day: str, kind: str):
 
     for chat_id, grp in get_group_chats():
         caption = build_caption(snapshot, day, focus=grp if grp in GROUPS else None, kind=kind)
-        await publish(chat_id, day, png, caption, pin=True)
+        await publish(chat_id, day, png, caption, managed=True)
         await asyncio.sleep(0.1)
 
     heading = "☀️ <b>Доброго ранку!</b>" if kind == "morning" else "🌙 <b>Графік на завтра</b>"
     for chat_id, grp in get_private_subscribers():
         if grp == "all":
             caption = build_caption(snapshot, day, kind=kind)
-            await publish(chat_id, day, png, caption, pin=False)
+            await publish(chat_id, day, png, caption)
         elif grp in snapshot:
             await safe_send(chat_id, format_day_text(grp, snapshot[grp], day, f"{heading} Черга <b>{grp}</b>"))
         await asyncio.sleep(0.1)
@@ -870,25 +940,27 @@ async def refresh_cards_after_midnight():
         return
     all_days = {d for v in snapshot.values() for d in v.get("days", {})}
     days = upcoming_days(all_days)
+    if not days:  # на нову дату графіка ще нема — нічого не надсилаємо
+        return
     pngs = {day: await make_overview(snapshot, day, set(), False) for day in days}
     for chat_id, grp in get_group_chats():
         for day in days:
             caption = build_caption(snapshot, day, focus=grp if grp in GROUPS else None)
-            await publish(chat_id, day, pngs.get(day), caption, pin=True, silent=True)
+            await publish(chat_id, day, pngs.get(day), caption, managed=True, silent=True)
             await asyncio.sleep(0.1)
 
 
 async def digest_loop():
     while True:
         try:
-            await expire_old_pins()
-
             if ROLLOVER_REFRESH:
                 rollover_key = f"rollover:{date.today():%Y%m%d}"
                 if not was_reminder_sent(rollover_key):
                     mark_reminder_sent(rollover_key)
                     if get_all_pins():
                         await refresh_cards_after_midnight()
+
+            await expire_old_pins()  # вчорашні картинки: відкріпити й видалити
 
             if DIGESTS:
                 now = datetime.now()
@@ -1028,12 +1100,12 @@ async def monitor_loop():
         try:
             async with aiohttp.ClientSession() as session:
                 while True:
-                    logging.info(f"Перевірка ЛОЕ (інтервал {CHECK_INTERVAL}с)...")
+                    logging.debug(f"Перевірка ЛОЕ (інтервал {CHECK_INTERVAL}с)...")
                     try:
                         body_text = await fetch_schedule_text(session)
                         all_groups = extract_all_groups(body_text)
                         days_seen = sorted({d for v in all_groups.values() for d in v.get("days", {})})
-                        logging.info(f"Розпізнано черг: {len(all_groups)}, дати: {', '.join(days_seen) or '—'}")
+                        logging.debug(f"Розпізнано черг: {len(all_groups)}, дати: {', '.join(days_seen) or '—'}")
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
@@ -1072,6 +1144,7 @@ HELP_TEXT = (
     "/all — зведена картинка по всіх чергах (сьогодні + завтра)\n"
     "/pin — (у групі) оновити і закріпити свіжий графік\n"
     "/next — найближче вимкнення\n"
+    "/settings — сповіщення за 5/10/15 хв, закріплення\n"
     "/stop — відписатись від сповіщень\n"
     "/help — ця довідка"
 )
@@ -1121,6 +1194,91 @@ async def cb_set_group(callback: types.CallbackQuery):
     await callback.answer(f"Обрано чергу {grp}")
 
 
+def settings_view(chat_id: int, is_private: bool) -> tuple[str, InlineKeyboardMarkup]:
+    cfg = get_settings(chat_id)
+    sub = get_subscription(chat_id)
+    lines = ["⚙️ <b>Налаштування чату</b>", ""]
+    if not sub:
+        lines += ["⚠️ Чат ще не підписаний: /start (в особистих) або /bind 5.1 (у групі).", ""]
+    elif sub[1] == "all":
+        lines += ["ℹ️ Нагадування про вимкнення працюють для конкретної черги: /bind 5.1", ""]
+
+    if cfg["notify"]:
+        lines.append(f"🔔 Нагадую <b>за {cfg['lead']} хв</b> до вимкнення і до повернення світла")
+    else:
+        lines.append("🔕 Нагадування вимкнено (оновлення графіка все одно приходять)")
+
+    kb = [[InlineKeyboardButton(
+        text="🔔 Сповіщати: так ✅" if cfg["notify"] else "🔕 Сповіщати: ні ❌", callback_data="cfg:notify"
+    )]]
+    if cfg["notify"]:
+        kb.append([
+            InlineKeyboardButton(
+                text=f"✅ за {m} хв" if m == cfg["lead"] else f"за {m} хв", callback_data=f"cfg:lead:{m}"
+            )
+            for m in LEAD_OPTIONS
+        ])
+    if not is_private and PIN_SCHEDULE:
+        lines.append("📌 Закріплення графіка: " + ("так" if cfg["pin"] else "ні"))
+        kb.append([InlineKeyboardButton(
+            text="📌 Закріплювати: так ✅" if cfg["pin"] else "📌 Закріплювати: ні ❌", callback_data="cfg:pin"
+        )])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: types.Message):
+    text, kb = settings_view(message.chat.id, message.chat.type == "private")
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("cfg:"))
+async def cb_settings(callback: types.CallbackQuery):
+    msg = callback.message
+    if msg is None:
+        await callback.answer()
+        return
+    chat = msg.chat
+    is_private = chat.type == "private"
+    parts = callback.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "open":  # з клавіатури вибору черги — нове повідомлення, щоб не ламати вибір черги
+        text, kb = settings_view(chat.id, is_private)
+        await msg.answer(text, reply_markup=kb, parse_mode="HTML")
+        await callback.answer()
+        return
+
+    if not is_private:  # у групах міняти налаштування можуть лише адміни
+        try:
+            member = await bot.get_chat_member(chat.id, callback.from_user.id)
+            allowed = member.status in ("creator", "administrator")
+        except TelegramAPIError:
+            allowed = False
+        if not allowed:
+            await callback.answer("Змінювати налаштування можуть лише адміни чату", show_alert=True)
+            return
+
+    cfg = get_settings(chat.id)
+    if action == "notify":
+        update_setting(chat.id, notify=not cfg["notify"])
+    elif action == "lead" and len(parts) == 3 and parts[2].isdigit() and int(parts[2]) in LEAD_OPTIONS:
+        update_setting(chat.id, lead=int(parts[2]))
+    elif action == "pin" and not is_private:
+        update_setting(chat.id, pin=not cfg["pin"])
+        await apply_pin_setting(chat.id, not cfg["pin"])
+    else:
+        await callback.answer()
+        return
+
+    text, kb = settings_view(chat.id, is_private)
+    try:
+        await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
+    await callback.answer("Збережено")
+
+
 @dp.message(Command("bind"))
 async def cmd_bind_chat(message: types.Message):
     parts = (message.text or "").split()
@@ -1146,7 +1304,7 @@ async def cmd_bind_chat(message: types.Message):
         if hint:
             await message.answer(hint.strip(), parse_mode="HTML")
         if get_all_saved() and USE_IMAGES:
-            await send_overview(message.chat.id, pin=message.chat.type != "private")
+            await send_overview(message.chat.id, managed=message.chat.type != "private")
         return
 
     saved = get_saved_schedule(grp)
@@ -1160,7 +1318,7 @@ async def cmd_bind_chat(message: types.Message):
 
     await message.answer(text, parse_mode="HTML")
     if saved and USE_IMAGES and message.chat.type != "private":
-        await send_overview(message.chat.id, focus=grp, pin=True)
+        await send_overview(message.chat.id, focus=grp, managed=True)
 
 
 @dp.message(Command("now"))
@@ -1192,8 +1350,9 @@ async def cmd_now(message: types.Message):
         await message.answer(format_chat_message(grp, saved, is_update=False), parse_mode="HTML")
 
 
-async def send_overview(chat_id: int, focus: str | None = None, pin: bool = False, kind: str | None = None) -> bool:
-    """Картинки-зведення на сьогодні та завтра (pin=True — закріпити замість старих)."""
+async def send_overview(chat_id: int, focus: str | None = None, managed: bool = False,
+                        force_pin: bool = False, kind: str | None = None) -> bool:
+    """Картинки-зведення на сьогодні та завтра. False — якщо актуального графіка ще нема."""
     snapshot = get_all_saved()
     if not snapshot:
         return False
@@ -1202,7 +1361,7 @@ async def send_overview(chat_id: int, focus: str | None = None, pin: bool = Fals
     for day in upcoming_days(all_days):
         png = await make_overview(snapshot, day, set(), False)
         caption = build_caption(snapshot, day, focus=focus, kind=kind)
-        ok |= await publish(chat_id, day, png, caption, pin=pin)
+        ok |= await publish(chat_id, day, png, caption, managed=managed, force_pin=force_pin)
     return ok
 
 
@@ -1235,7 +1394,7 @@ async def show_day(message: types.Message, offset: int):
         return
     png = await make_overview(snapshot, day, set(), False)
     caption = build_caption(snapshot, day, focus=grp if grp in GROUPS else None)
-    await publish(message.chat.id, day, png, caption, pin=False)
+    await publish(message.chat.id, day, png, caption)
 
 
 @dp.message(Command("today"))
@@ -1260,7 +1419,12 @@ async def cmd_pin(message: types.Message):
     if not get_all_saved() or not USE_IMAGES:
         await message.answer("Дані ще завантажуються або картинки вимкнено.")
         return
-    await send_overview(message.chat.id, focus=sub[1] if sub[1] in GROUPS else None, pin=True)
+    ok = await send_overview(
+        message.chat.id, focus=sub[1] if sub[1] in GROUPS else None, managed=True, force_pin=True
+    )
+    if not ok:
+        await message.answer("Актуального графіка на сьогодні чи завтра ще немає на сайті ЛОЕ.")
+        return
     hint = await pin_hint(message.chat.id)
     if hint:
         await message.answer(hint.strip(), parse_mode="HTML")
@@ -1287,7 +1451,8 @@ async def cmd_all(message: types.Message):
     if not USE_IMAGES:
         await message.answer("Картинки вимкнено (встанови pillow: python -m pip install pillow).")
         return
-    await send_overview(message.chat.id)
+    if not await send_overview(message.chat.id):
+        await message.answer("Актуального графіка на сьогодні чи завтра ще немає на сайті ЛОЕ.")
 
 
 @dp.message(Command("next"))
@@ -1327,6 +1492,7 @@ async def main():
         raise RuntimeError("Не задано BOT_TOKEN! Створи файл .env поруч із bot.py: BOT_TOKEN=твій_токен")
 
     init_db()
+    logging.info(f"Бот запущено. Перевірка ЛОЕ кожні {CHECK_INTERVAL}с.")
     monitor_task = asyncio.create_task(monitor_loop())
     reminders_task = asyncio.create_task(reminders_loop())
     digest_task = asyncio.create_task(digest_loop())

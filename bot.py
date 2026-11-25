@@ -12,7 +12,7 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import BotCommand, BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from dotenv import load_dotenv
 
 try:
@@ -56,6 +56,12 @@ ROLLOVER_REFRESH = os.getenv("ROLLOVER_REFRESH", "1") == "1"  # тиха зам�
 MORNING_TIME = os.getenv("MORNING_TIME", "07:00")           # графік на сьогодні
 EVENING_TIME = os.getenv("EVENING_TIME", "20:00")           # графік на завтра
 
+# моніторинг і діагностика
+HEARTBEAT_MINUTES = max(1, int(os.getenv("HEARTBEAT_MINUTES", "5")))  # як часто писати в лог «перевірка ок», хв
+LOG_EVERY_CHECK = os.getenv("LOG_EVERY_CHECK", "0") == "1"           # 1 — писати в лог кожну перевірку (шумно)
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)                        # твій Telegram id: алерти про збої/зміни сайту
+ALERT_AFTER_ERRORS = 5                                                 # скільки збійних перевірок поспіль до алерта
+
 WEEKDAYS = ["понеділок", "вівторок", "середа", "четвер", "пʼятниця", "субота", "неділя"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -63,6 +69,28 @@ if _card_err:
     logging.warning(f"Картинки вимкнено: {_card_err} (встанови: python -m pip install pillow)")
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
+
+STATUS = {
+    "started": datetime.now(),
+    "checks": 0, "errors": 0, "consecutive_errors": 0,
+    "last_ok": None, "last_error": None, "last_error_text": "",
+    "last_change": None, "groups": 0, "days": [],
+    "last_beat": None, "beat_checks": 0,
+}
+
+BOT_COMMANDS = [
+    ("start", "Обрати чергу / налаштувати чат"),
+    ("settings", "Налаштування: черга, сповіщення, закріплення"),
+    ("today", "Графік на сьогодні"),
+    ("tomorrow", "Графік на завтра"),
+    ("now", "Поточний графік"),
+    ("all", "Зведена картинка по всіх чергах"),
+    ("next", "Найближче вимкнення"),
+    ("pin", "Оновити і закріпити графік (у групі)"),
+    ("status", "Стан бота і перевірок сайту ЛОЕ"),
+    ("stop", "Відписатись від сповіщень"),
+    ("help", "Довідка"),
+]
 
 
 # ---------------------------------------------------------------- DB
@@ -118,6 +146,14 @@ def set_subscription(chat_id: int, chat_type: str, group_name: str):
             "INSERT OR REPLACE INTO subscribers (chat_id, chat_type, group_name) VALUES (?, ?, ?)",
             (chat_id, chat_type, group_name),
         )
+
+
+def count_subscribers() -> tuple[int, int]:
+    """(особисті, групові)"""
+    with db() as conn:
+        p = conn.execute("SELECT COUNT(*) FROM subscribers WHERE chat_type = 'private'").fetchone()[0]
+        g = conn.execute("SELECT COUNT(*) FROM subscribers WHERE chat_type != 'private'").fetchone()[0]
+    return p, g
 
 
 def remove_subscription(chat_id: int):
@@ -506,12 +542,25 @@ def format_chat_message(group_name: str, new_data: dict, old_data: dict | None =
     return "\n".join(lines).strip()
 
 
-def get_groups_keyboard() -> InlineKeyboardMarkup:
+def get_groups_keyboard(is_private: bool = True, current: str | None = None, back: bool = False) -> InlineKeyboardMarkup:
+    """Вибір черги. current — поточна (позначається ✅); back — «Назад» замість «Налаштування»."""
     rows = []
     for i in range(0, len(GROUPS), 4):
-        row = [InlineKeyboardButton(text=f"Черга {g}", callback_data=f"set_grp:{g}") for g in GROUPS[i:i + 4]]
-        rows.append(row)
-    rows.append([InlineKeyboardButton(text="⚙️ Налаштування сповіщень", callback_data="cfg:open")])
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{'✅ ' if g == current else ''}Черга {g}", callback_data=f"set_grp:{g}"
+            )
+            for g in GROUPS[i:i + 4]
+        ])
+    if not is_private:
+        rows.append([InlineKeyboardButton(
+            text=f"{'✅ ' if current == 'all' else ''}📊 Усі черги разом", callback_data="set_grp:all"
+        )])
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="cfg:back")
+        if back
+        else InlineKeyboardButton(text="⚙️ Налаштування сповіщень", callback_data="cfg:open")
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1050,11 +1099,24 @@ async def health_server():
         await runner.cleanup()
 
 
-async def process_update(all_groups: dict):
+async def notify_owner(text: str):
+    """Особисте повідомлення власнику (OWNER_ID) — про збої/зміни/перезапуск. Без OWNER_ID нічого не робить."""
+    if not OWNER_ID or not bot:
+        return
+    try:
+        await bot.send_message(OWNER_ID, text, parse_mode="HTML")
+    except TelegramAPIError as e:
+        logging.warning(f"Не вдалось написати власнику ({OWNER_ID}): {e}")
+
+
+async def process_update(all_groups: dict) -> dict:
+    """Порівнює з базою, розсилає зміни. Повертає підсумок для логів: {saved, first_load, days}."""
     changed_by_day: dict[str, set] = {}
     grp_changed_days: dict[str, list[str]] = {}
     olds: dict[str, dict | None] = {}
     prev_days = {d for g in GROUPS for d in ((get_saved_schedule(g) or {}).get("days", {}))}
+    saved_groups = 0
+    first_load = 0
 
     for grp, new_data in all_groups.items():
         old_data = get_saved_schedule(grp)
@@ -1062,9 +1124,11 @@ async def process_update(all_groups: dict):
             continue
 
         save_schedule(grp, new_data)
+        saved_groups += 1
 
         # перше завантаження в порожню базу — не розсилаємо "оновлення"
         if old_data is None:
+            first_load += 1
             continue
 
         olds[grp] = old_data
@@ -1075,6 +1139,9 @@ async def process_update(all_groups: dict):
             if old_iv != info.get("intervals"):
                 changed_by_day.setdefault(day, set()).add(grp)
                 grp_changed_days.setdefault(grp, []).append(day)
+
+    if saved_groups:
+        STATUS["last_change"] = datetime.now()
 
     # сповіщаємо лише про реальні зміни (зникнення вчорашнього дня — не оновлення)
     new_days = {d for d in changed_by_day if d not in prev_days}
@@ -1094,34 +1161,95 @@ async def process_update(all_groups: dict):
             mark_reminder_sent(f"digest:day:{day}")
         logging.info("Зафіксовано зміни графіка, розіслано сповіщення.")
 
+    return {"saved": saved_groups, "first_load": first_load, "days": sorted_days(changed_by_day.keys())}
+
+
+def record_check_error(reason: str):
+    STATUS["checks"] += 1
+    STATUS["errors"] += 1
+    STATUS["consecutive_errors"] += 1
+    STATUS["last_error"] = datetime.now()
+    STATUS["last_error_text"] = reason[:200]
+
+
+async def check_alerts():
+    if STATUS["consecutive_errors"] == ALERT_AFTER_ERRORS:  # рівно один раз за серію збоїв
+        await notify_owner(
+            f"⚠️ <b>Сайт ЛОЕ не віддає графік</b> уже {ALERT_AFTER_ERRORS} перевірок поспіль.\n"
+            f"Причина: <code>{html.escape(STATUS['last_error_text'])}</code>"
+        )
+
+
+def log_check(summary: dict):
+    """Видимий слід перевірок у логах: перша, кожна зі змінами, далі раз на HEARTBEAT_MINUTES."""
+    s = STATUS
+    now_m = time.monotonic()
+    changed = bool(summary.get("saved"))
+    due = s["last_beat"] is None or now_m - s["last_beat"] >= HEARTBEAT_MINUTES * 60
+    if not (LOG_EVERY_CHECK or changed or due):
+        return
+    if summary.get("first_load"):
+        note = f"перше завантаження, записано черг: {summary['first_load']}"
+    elif summary.get("days"):
+        note = "ЗМІНИ на " + ", ".join(summary["days"])
+    elif changed:
+        note = "дані на сайті оновились, актуальні дні без змін"
+    else:
+        note = "без змін"
+    since = s["checks"] - s["beat_checks"]
+    logging.info(
+        f"🔎 Перевірка ЛОЕ ок: черг {s['groups']}, дати {', '.join(s['days']) or '—'} — {note} "
+        f"(перевірок з минулого звіту: {since}, помилок усього: {s['errors']})"
+    )
+    s["last_beat"] = now_m
+    s["beat_checks"] = s["checks"]
+
 
 async def monitor_loop():
     while True:  # зовнішній цикл: якщо щось впало — стартуємо заново
         try:
             async with aiohttp.ClientSession() as session:
                 while True:
-                    logging.debug(f"Перевірка ЛОЕ (інтервал {CHECK_INTERVAL}с)...")
                     try:
                         body_text = await fetch_schedule_text(session)
                         all_groups = extract_all_groups(body_text)
                         days_seen = sorted({d for v in all_groups.values() for d in v.get("days", {})})
-                        logging.debug(f"Розпізнано черг: {len(all_groups)}, дати: {', '.join(days_seen) or '—'}")
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
+                        record_check_error(f"запит до API: {e}")
                         logging.error(f"Помилка запиту до API ЛОЕ: {e}")
+                        await check_alerts()
                         await asyncio.sleep(CHECK_INTERVAL)
                         continue
 
                     if not all_groups:
+                        record_check_error("не розпізнано жодної черги (змінився формат?)")
                         logging.warning("Не вдалось розпізнати жодної черги у відповіді API (змінився формат?).")
+                        await check_alerts()
                     else:
+                        was_failing = STATUS["consecutive_errors"] >= ALERT_AFTER_ERRORS
+                        STATUS["checks"] += 1
+                        STATUS["consecutive_errors"] = 0
+                        STATUS["last_ok"] = datetime.now()
+                        STATUS["groups"] = len(all_groups)
+                        STATUS["days"] = days_seen
+                        if was_failing:
+                            await notify_owner("✅ Звʼязок із сайтом ЛОЕ відновлено.")
+
+                        summary: dict = {}
                         try:
-                            await process_update(all_groups)
+                            summary = await process_update(all_groups)
                         except asyncio.CancelledError:
                             raise
                         except Exception as e:
                             logging.error(f"Помилка обробки оновлення: {e}")
+                        log_check(summary)
+                        if summary.get("days"):
+                            await notify_owner(
+                                "🔔 <b>На сайті ЛОЕ змінився графік</b>: "
+                                + ", ".join(pretty_day(d) for d in summary["days"])
+                            )
 
                     await asyncio.sleep(CHECK_INTERVAL)
         except asyncio.CancelledError:
@@ -1136,6 +1264,7 @@ async def monitor_loop():
 HELP_TEXT = (
     "<b>Команди:</b>\n"
     "/start — обрати чергу (в особистих)\n"
+    "/bind — вибір черги кнопками (для груп — адмінам)\n"
     "/bind all — групі надсилати всі черги разом\n"
     "/bind 5.1 — прив'язати чат до однієї черги\n"
     "/today — графік на сьогодні\n"
@@ -1144,26 +1273,53 @@ HELP_TEXT = (
     "/all — зведена картинка по всіх чергах (сьогодні + завтра)\n"
     "/pin — (у групі) оновити і закріпити свіжий графік\n"
     "/next — найближче вимкнення\n"
-    "/settings — сповіщення за 5/10/15 хв, закріплення\n"
+    "/settings — кнопки: черга, сповіщення за 5/10/15 хв, закріплення, відписка\n"
+    "/status — стан бота і перевірок сайту ЛОЕ\n"
     "/stop — відписатись від сповіщень\n"
     "/help — ця довідка"
 )
 
 
+PICK_TEXT_PRIVATE = "Обери свою фактичну чергу відключень (наприклад, <b>5.1</b>):"
+PICK_TEXT_GROUP = (
+    "Обери, який графік показувати в цьому чаті:\n"
+    "• <b>Черга X.Y</b> — зведення по всіх чергах + деталі по обраній\n"
+    "• <b>Усі черги разом</b> — лише зведення\n\n"
+    "<i>Змінювати налаштування можуть лише адміни чату.</i>"
+)
+
+
+async def is_chat_admin(chat_id: int, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+    except TelegramAPIError:
+        return False
+    return member.status in ("creator", "administrator")
+
+
+async def message_from_admin(message: types.Message) -> bool:
+    """В особистих — завжди так; у групах — лише адмін (включно з анонімним адміном)."""
+    if message.chat.type == "private":
+        return True
+    if message.sender_chat and message.sender_chat.id == message.chat.id:  # адмін, що пише анонімно
+        return True
+    return bool(message.from_user) and await is_chat_admin(message.chat.id, message.from_user.id)
+
+
+def current_group(chat_id: int) -> str | None:
+    sub = get_subscription(chat_id)
+    return sub[1] if sub else None
+
+
 @dp.message(Command("start", "group"))
 async def cmd_start(message: types.Message):
     logging.info(f"Отримано /start у чаті {message.chat.id} ({message.chat.type})")
-    if message.chat.type == "private":
-        await message.answer(
-            "Обери свою фактичну чергу відключень (наприклад, <b>5.1</b>):",
-            reply_markup=get_groups_keyboard(),
-            parse_mode="HTML",
-        )
-    else:
-        await message.answer(
-            "Щоб отримувати графік у цьому чаті:\n<code>/bind all</code> — усі черги одним зведенням\n<code>/bind 5.1</code> — зведення + деталі по черзі 5.1",
-            parse_mode="HTML",
-        )
+    is_private = message.chat.type == "private"
+    await message.answer(
+        PICK_TEXT_PRIVATE if is_private else PICK_TEXT_GROUP,
+        reply_markup=get_groups_keyboard(is_private, current=current_group(message.chat.id)),
+        parse_mode="HTML",
+    )
 
 
 @dp.message(Command("help"))
@@ -1171,27 +1327,62 @@ async def cmd_help(message: types.Message):
     await message.answer(HELP_TEXT, parse_mode="HTML")
 
 
+async def send_bind_extras(chat_id: int, chat_type: str, grp: str):
+    """Після прив'язки: підказка про права адміна (група) і свіжа картинка графіка."""
+    is_group = chat_type != "private"
+    if is_group:
+        hint = await pin_hint(chat_id)
+        if hint:
+            await bot.send_message(chat_id, hint.strip(), parse_mode="HTML")
+    if not USE_IMAGES:
+        return
+    if grp == "all":
+        if get_all_saved():
+            await send_overview(chat_id, managed=is_group)
+    elif is_group and get_saved_schedule(grp):
+        await send_overview(chat_id, focus=grp, managed=True)
+
+
 @dp.callback_query(F.data.startswith("set_grp:"))
 async def cb_set_group(callback: types.CallbackQuery):
-    grp = callback.data.split(":")[1]
-    if grp not in GROUPS:
+    msg = callback.message
+    if msg is None:
+        await callback.answer()
+        return
+    chat = msg.chat
+    is_private = chat.type == "private"
+    grp = callback.data.split(":", 1)[1]
+    if grp not in GROUPS and not (grp == "all" and not is_private):
         await callback.answer("Невідома черга")
         return
+    if not is_private and not await is_chat_admin(chat.id, callback.from_user.id):
+        await callback.answer("Змінювати чергу можуть лише адміни чату", show_alert=True)
+        return
 
-    set_subscription(callback.message.chat.id, "private", grp)
-    saved = get_saved_schedule(grp)
+    set_subscription(chat.id, chat.type, grp)
 
-    text = f"✅ Встановлено <b>чергу {grp}</b>.\n\n"
-    if saved:
-        text += format_personal_message(grp, saved, is_update=False)
-    else:
-        text += "Дані з сайту ЛОЕ ще завантажуються, надішлю графік одразу після першої перевірки."
+    if is_private:
+        saved = get_saved_schedule(grp)
+        text = f"✅ Встановлено <b>чергу {grp}</b>.\n\n"
+        if saved:
+            text += format_personal_message(grp, saved, is_update=False)
+        else:
+            text += "Дані з сайту ЛОЕ ще завантажуються, надішлю графік одразу після першої перевірки."
+        try:
+            await msg.edit_text(text, reply_markup=get_groups_keyboard(True, current=grp), parse_mode="HTML")
+        except TelegramBadRequest:
+            pass  # "message is not modified" — натиснули ту саму чергу ще раз
+        await callback.answer(f"Обрано чергу {grp}")
+        return
 
+    # група: перетворюємо повідомлення на меню налаштувань і надсилаємо свіжий графік
+    text, kb = settings_view(chat.id, False)
     try:
-        await callback.message.edit_text(text, reply_markup=get_groups_keyboard(), parse_mode="HTML")
+        await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except TelegramBadRequest:
-        pass  # "message is not modified" — натиснули ту саму чергу ще раз
-    await callback.answer(f"Обрано чергу {grp}")
+        pass
+    await callback.answer("Чат прив'язано: " + ("усі черги" if grp == "all" else f"черга {grp}"))
+    await send_bind_extras(chat.id, chat.type, grp)
 
 
 def settings_view(chat_id: int, is_private: bool) -> tuple[str, InlineKeyboardMarkup]:
@@ -1199,9 +1390,15 @@ def settings_view(chat_id: int, is_private: bool) -> tuple[str, InlineKeyboardMa
     sub = get_subscription(chat_id)
     lines = ["⚙️ <b>Налаштування чату</b>", ""]
     if not sub:
-        lines += ["⚠️ Чат ще не підписаний: /start (в особистих) або /bind 5.1 (у групі).", ""]
+        lines += ["⚠️ Чат ще не підписаний — натисни «Обрати чергу».", ""]
     elif sub[1] == "all":
-        lines += ["ℹ️ Нагадування про вимкнення працюють для конкретної черги: /bind 5.1", ""]
+        lines += [
+            "📍 Показую: <b>усі черги разом</b>",
+            "ℹ️ Нагадування про вимкнення працюють для конкретної черги — обери її кнопкою нижче.",
+            "",
+        ]
+    else:
+        lines += [f"📍 Черга: <b>{sub[1]}</b>", ""]
 
     if cfg["notify"]:
         lines.append(f"🔔 Нагадую <b>за {cfg['lead']} хв</b> до вимкнення і до повернення світла")
@@ -1209,8 +1406,11 @@ def settings_view(chat_id: int, is_private: bool) -> tuple[str, InlineKeyboardMa
         lines.append("🔕 Нагадування вимкнено (оновлення графіка все одно приходять)")
 
     kb = [[InlineKeyboardButton(
-        text="🔔 Сповіщати: так ✅" if cfg["notify"] else "🔕 Сповіщати: ні ❌", callback_data="cfg:notify"
+        text="🔁 Змінити чергу" if sub else "➕ Обрати чергу", callback_data="cfg:queue"
     )]]
+    kb.append([InlineKeyboardButton(
+        text="🔔 Сповіщати: так ✅" if cfg["notify"] else "🔕 Сповіщати: ні ❌", callback_data="cfg:notify"
+    )])
     if cfg["notify"]:
         kb.append([
             InlineKeyboardButton(
@@ -1223,6 +1423,10 @@ def settings_view(chat_id: int, is_private: bool) -> tuple[str, InlineKeyboardMa
         kb.append([InlineKeyboardButton(
             text="📌 Закріплювати: так ✅" if cfg["pin"] else "📌 Закріплювати: ні ❌", callback_data="cfg:pin"
         )])
+    bottom = [InlineKeyboardButton(text="📊 Показати графік", callback_data="cfg:show")]
+    if sub:
+        bottom.append(InlineKeyboardButton(text="🚫 Відписатись", callback_data="cfg:stop"))
+    kb.append(bottom)
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
 
 
@@ -1230,6 +1434,24 @@ def settings_view(chat_id: int, is_private: bool) -> tuple[str, InlineKeyboardMa
 async def cmd_settings(message: types.Message):
     text, kb = settings_view(message.chat.id, message.chat.type == "private")
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+async def show_now(chat_id: int, is_private: bool):
+    """Кнопка «Показати графік»."""
+    sub = get_subscription(chat_id)
+    if not sub:
+        await bot.send_message(chat_id, "Спочатку обери чергу: /settings → «Обрати чергу».")
+        return
+    grp = sub[1]
+    if is_private and grp in GROUPS:
+        saved = get_saved_schedule(grp)
+        text = format_personal_message(grp, saved, is_update=False) if saved else "Дані ще завантажуються, спробуй за хвилину."
+        await bot.send_message(chat_id, text, parse_mode="HTML")
+    elif USE_IMAGES and get_all_saved():
+        if not await send_overview(chat_id, focus=grp if grp in GROUPS else None):
+            await bot.send_message(chat_id, "Актуального графіка на сьогодні чи завтра ще немає на сайті ЛОЕ.")
+    else:
+        await bot.send_message(chat_id, "Дані ще завантажуються або картинки вимкнено.")
 
 
 @dp.callback_query(F.data.startswith("cfg:"))
@@ -1249,17 +1471,18 @@ async def cb_settings(callback: types.CallbackQuery):
         await callback.answer()
         return
 
+    if action == "show":  # перегляд доступний усім
+        await callback.answer()
+        await show_now(chat.id, is_private)
+        return
+
     if not is_private:  # у групах міняти налаштування можуть лише адміни
-        try:
-            member = await bot.get_chat_member(chat.id, callback.from_user.id)
-            allowed = member.status in ("creator", "administrator")
-        except TelegramAPIError:
-            allowed = False
-        if not allowed:
+        if not await is_chat_admin(chat.id, callback.from_user.id):
             await callback.answer("Змінювати налаштування можуть лише адміни чату", show_alert=True)
             return
 
     cfg = get_settings(chat.id)
+    toast: str | None = "Збережено"
     if action == "notify":
         update_setting(chat.id, notify=not cfg["notify"])
     elif action == "lead" and len(parts) == 3 and parts[2].isdigit() and int(parts[2]) in LEAD_OPTIONS:
@@ -1267,6 +1490,22 @@ async def cb_settings(callback: types.CallbackQuery):
     elif action == "pin" and not is_private:
         update_setting(chat.id, pin=not cfg["pin"])
         await apply_pin_setting(chat.id, not cfg["pin"])
+    elif action == "queue":  # вибір черги прямо в цьому повідомленні
+        try:
+            await msg.edit_text(
+                PICK_TEXT_PRIVATE if is_private else PICK_TEXT_GROUP,
+                reply_markup=get_groups_keyboard(is_private, current=current_group(chat.id), back=True),
+                parse_mode="HTML",
+            )
+        except TelegramBadRequest:
+            pass
+        await callback.answer()
+        return
+    elif action == "back":
+        toast = None
+    elif action == "stop":
+        remove_subscription(chat.id)
+        toast = "Відписано"
     else:
         await callback.answer()
         return
@@ -1276,18 +1515,26 @@ async def cb_settings(callback: types.CallbackQuery):
         await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except TelegramBadRequest:
         pass
-    await callback.answer("Збережено")
+    await callback.answer(toast)
 
 
 @dp.message(Command("bind"))
 async def cmd_bind_chat(message: types.Message):
+    if not await message_from_admin(message):
+        await message.answer("Прив'язувати чат можуть лише адміни.")
+        return
+
     parts = (message.text or "").split()
-    grp = parts[1].lower() if len(parts) > 1 else "all"
+    if len(parts) < 2:  # без аргументу — інтерактивний вибір кнопками
+        await cmd_start(message)
+        return
+    grp = parts[1].lower()
 
     if grp != "all" and grp not in GROUPS:
         await message.answer(
             f"Вкажи чергу або <code>all</code>. Доступні: {', '.join(GROUPS)}\n"
-            "Приклади: <code>/bind all</code> (усі черги) або <code>/bind 5.1</code>",
+            "Приклади: <code>/bind all</code> (усі черги) або <code>/bind 5.1</code>. "
+            "Або просто /bind — тоді оберу кнопками.",
             parse_mode="HTML",
         )
         return
@@ -1297,28 +1544,46 @@ async def cmd_bind_chat(message: types.Message):
     if grp == "all":
         await message.answer(
             "✅ Цей чат отримуватиме оновлення графіка по <b>всіх чергах</b> одним зведенням з картинкою.\n"
-            "Подивитись зараз: /all",
+            "Подивитись зараз: /all · Налаштування: /settings",
             parse_mode="HTML",
         )
-        hint = await pin_hint(message.chat.id) if message.chat.type != "private" else ""
-        if hint:
-            await message.answer(hint.strip(), parse_mode="HTML")
-        if get_all_saved() and USE_IMAGES:
-            await send_overview(message.chat.id, managed=message.chat.type != "private")
-        return
-
-    saved = get_saved_schedule(grp)
-    text = f"✅ Цей чат прив'язано до <b>черги {grp}</b> (картинка по всіх чергах + деталі по {grp}).\n\n"
-    if saved:
-        text += format_chat_message(grp, saved, is_update=False)
     else:
-        text += "Очікую перше оновлення з сайту ЛОЕ..."
-    if message.chat.type != "private":
-        text += await pin_hint(message.chat.id)
+        saved = get_saved_schedule(grp)
+        text = f"✅ Цей чат прив'язано до <b>черги {grp}</b> (картинка по всіх чергах + деталі по {grp}).\n\n"
+        text += format_chat_message(grp, saved, is_update=False) if saved else "Очікую перше оновлення з сайту ЛОЕ..."
+        await message.answer(text, parse_mode="HTML")
+    await send_bind_extras(message.chat.id, message.chat.type, grp)
 
-    await message.answer(text, parse_mode="HTML")
-    if saved and USE_IMAGES and message.chat.type != "private":
-        await send_overview(message.chat.id, focus=grp, managed=True)
+
+def fmt_dt(dt: datetime | None) -> str:
+    return dt.strftime("%d.%m %H:%M:%S") if dt else "—"
+
+
+def status_text() -> str:
+    s = STATUS
+    now = datetime.now()
+    lines = ["🩺 <b>Стан бота</b>", ""]
+    if s["last_ok"]:
+        ago = int((now - s["last_ok"]).total_seconds())
+        lines.append(f"🌐 Остання успішна перевірка ЛОЕ: <b>{fmt_dt(s['last_ok'])}</b> ({ago} с тому)")
+    else:
+        lines.append("🌐 Успішних перевірок ЛОЕ ще не було")
+    lines.append(f"🔁 Інтервал: {CHECK_INTERVAL} с · перевірок: {s['checks']} · помилок: {s['errors']}")
+    lines.append(f"📋 Розпізнано черг: {s['groups']} · дати: {', '.join(s['days']) or '—'}")
+    lines.append(f"🕒 Дані в базі востаннє змінились: {fmt_dt(s['last_change'])}")
+    if s["consecutive_errors"]:
+        lines.append(
+            f"⚠️ Помилок поспіль: <b>{s['consecutive_errors']}</b> — <code>{html.escape(s['last_error_text'])}</code>"
+        )
+    priv, grp = count_subscribers()
+    lines.append(f"👥 Підписано: {priv} особистих, {grp} групових чатів")
+    lines.append(f"⏱ Працюю: {format_duration(int((now - s['started']).total_seconds() // 60))}")
+    return "\n".join(lines)
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: types.Message):
+    await message.answer(status_text(), parse_mode="HTML")
 
 
 @dp.message(Command("now"))
@@ -1478,11 +1743,14 @@ async def cmd_next(message: types.Message):
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message):
+    if not await message_from_admin(message):
+        await message.answer("Відписати чат можуть лише адміни.")
+        return
     if get_subscription(message.chat.id):
         remove_subscription(message.chat.id)
-        await message.answer("🔕 Сповіщення вимкнено. Щоб підписатись знову — /start або /bind 5.1.")
+        await message.answer("🔕 Сповіщення вимкнено. Щоб підписатись знову — /start.")
     else:
-        await message.answer("Ти ще не підписаний на жодну чергу.")
+        await message.answer("Цей чат ще не підписаний на жодну чергу.")
 
 
 # ---------------------------------------------------------------- Main
@@ -1492,7 +1760,14 @@ async def main():
         raise RuntimeError("Не задано BOT_TOKEN! Створи файл .env поруч із bot.py: BOT_TOKEN=твій_токен")
 
     init_db()
-    logging.info(f"Бот запущено. Перевірка ЛОЕ кожні {CHECK_INTERVAL}с.")
+    logging.info(f"Бот запущено. Перевірка ЛОЕ кожні {CHECK_INTERVAL}с, звіт у лог раз на {HEARTBEAT_MINUTES} хв.")
+    try:  # меню «/» у Telegram
+        await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in BOT_COMMANDS])
+    except TelegramAPIError as e:
+        logging.warning(f"Не вдалось встановити меню команд: {e}")
+    priv, grp = count_subscribers()
+    logging.info(f"У базі підписано чатів: {priv} особистих, {grp} групових (DB_PATH={DB_PATH})")
+    await notify_owner(f"🚀 Бот запущено. Підписано: {priv} особистих, {grp} групових чатів.")
     monitor_task = asyncio.create_task(monitor_loop())
     reminders_task = asyncio.create_task(reminders_loop())
     digest_task = asyncio.create_task(digest_loop())

@@ -2183,6 +2183,34 @@ def is_owner(message: types.Message) -> bool:
     return bool(OWNER_ID) and message.chat.type == "private" and bool(message.from_user) and message.from_user.id == OWNER_ID
 
 
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    """Скільки підписано і по яких чергах (лише власнику)."""
+    if not is_owner(message):
+        return
+    priv, grp = count_subscribers()
+    with db() as conn:
+        per_group = {}
+        for (g,) in conn.execute("SELECT group_name FROM subscribers WHERE chat_type = 'private'").fetchall():
+            if g not in ("all",):
+                per_group.setdefault(g, set())
+        rows = conn.execute("SELECT chat_id, group_name FROM chat_groups").fetchall()
+        singles = conn.execute("SELECT chat_id, group_name FROM subscribers WHERE chat_type = 'private'").fetchall()
+    chats_by_group: dict[str, set] = {}
+    multi = {cid for cid, _ in rows}
+    for cid, g in rows:
+        chats_by_group.setdefault(g, set()).add(cid)
+    for cid, g in singles:
+        if cid not in multi:
+            chats_by_group.setdefault(g, set()).add(cid)
+    lines = ["📊 <b>Статистика</b>", "", f"👤 Особистих чатів: <b>{priv}</b>", f"👥 Групових чатів: <b>{grp}</b>"]
+    if chats_by_group:
+        lines += ["", "По чергах (особисті): " + ", ".join(
+            f"{g} — {len(chats_by_group[g])}" for g in GROUPS if g in chats_by_group
+        )]
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 @dp.message(Command("backup"))
 async def cmd_backup(message: types.Message):
     if not is_owner(message):

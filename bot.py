@@ -11,15 +11,20 @@ from datetime import date, datetime, timedelta
 import aiohttp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+try:
+    from aiogram.exceptions import TelegramMigrateToChat
+except ImportError:  # дуже стара версія aiogram
+    class TelegramMigrateToChat(TelegramAPIError):
+        migrate_to_chat_id = None
 from aiogram.filters import Command
-from aiogram.types import BotCommand, BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import BotCommand, BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from dotenv import load_dotenv
 
 try:
-    from card import render_overview_card, render_schedule_card
+    from card import THEMES, current_theme, render_overview_card, render_schedule_card
     _card_err = None
 except Exception as _e:  # Pillow не встановлено або card.py відсутній
-    render_schedule_card = render_overview_card = None
+    render_schedule_card = render_overview_card = current_theme = THEMES = None
     _card_err = _e
 
 load_dotenv(override=True)
@@ -60,6 +65,7 @@ EVENING_TIME = os.getenv("EVENING_TIME", "20:00")           # графік на 
 HEARTBEAT_MINUTES = max(1, int(os.getenv("HEARTBEAT_MINUTES", "5")))  # як часто писати в лог «перевірка ок», хв
 LOG_EVERY_CHECK = os.getenv("LOG_EVERY_CHECK", "0") == "1"           # 1 — писати в лог кожну перевірку (шумно)
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)                        # твій Telegram id: алерти про збої/зміни сайту
+STATUS_REFRESH_MINUTES = int(os.getenv("STATUS_REFRESH_MINUTES", "30"))  # тихо оновлювати закріплені графіки («зараз без світла…»); 0 — вимкнути
 ALERT_AFTER_ERRORS = 5                                                 # скільки збійних перевірок поспіль до алерта
 
 WEEKDAYS = ["понеділок", "вівторок", "середа", "четвер", "пʼятниця", "субота", "неділя"]
@@ -135,9 +141,15 @@ def init_db():
                 chat_id INTEGER PRIMARY KEY,
                 notify INTEGER NOT NULL DEFAULT 1,
                 lead INTEGER NOT NULL DEFAULT 15,
-                pin INTEGER NOT NULL DEFAULT 1
+                pin INTEGER NOT NULL DEFAULT 1,
+                notify_end INTEGER NOT NULL DEFAULT 1
             )
         """)
+        # міграція зі старої бази: нова колонка «нагадувати про ввімкнення» (спершу = старе notify)
+        cols = [r[1] for r in cur.execute("PRAGMA table_info(chat_settings)").fetchall()]
+        if "notify_end" not in cols:
+            cur.execute("ALTER TABLE chat_settings ADD COLUMN notify_end INTEGER NOT NULL DEFAULT 1")
+            cur.execute("UPDATE chat_settings SET notify_end = notify")
 
 
 def set_subscription(chat_id: int, chat_type: str, group_name: str):
@@ -154,6 +166,18 @@ def count_subscribers() -> tuple[int, int]:
         p = conn.execute("SELECT COUNT(*) FROM subscribers WHERE chat_type = 'private'").fetchone()[0]
         g = conn.execute("SELECT COUNT(*) FROM subscribers WHERE chat_type != 'private'").fetchone()[0]
     return p, g
+
+
+def migrate_chat(old_id: int, new_id: int):
+    """Група стала супергрупою (id змінився): переносимо підписку та налаштування.
+    Закріплені повідомлення не переносимо — у новому чаті в них інші id."""
+    if not new_id or old_id == new_id:
+        return
+    with db() as conn:
+        conn.execute("DELETE FROM pinned_messages WHERE chat_id = ?", (old_id,))
+        for table in ("subscribers", "chat_settings"):
+            conn.execute(f"UPDATE OR REPLACE {table} SET chat_id = ? WHERE chat_id = ?", (new_id, old_id))
+    logging.info(f"Чат {old_id} перенесено в {new_id} (група → супергрупа)")
 
 
 def remove_subscription(chat_id: int):
@@ -235,14 +259,14 @@ def get_chat_pins(chat_id: int) -> list[tuple[str, int]]:
 
 
 def get_settings(chat_id: int) -> dict:
-    """Налаштування чату: сповіщати так/ні, за скільки хвилин, закріплювати так/ні."""
+    """Налаштування чату: нагадування перед вимкненням, перед ввімкненням, за скільки хвилин, закріплення."""
     with db() as conn:
         row = conn.execute(
-            "SELECT notify, lead, pin FROM chat_settings WHERE chat_id = ?", (chat_id,)
+            "SELECT notify, lead, pin, notify_end FROM chat_settings WHERE chat_id = ?", (chat_id,)
         ).fetchone()
     if not row:
-        return {"notify": True, "lead": REMINDER_MINUTES_BEFORE, "pin": True}
-    return {"notify": bool(row[0]), "lead": int(row[1]), "pin": bool(row[2])}
+        return {"notify": True, "notify_end": True, "lead": REMINDER_MINUTES_BEFORE, "pin": True}
+    return {"notify": bool(row[0]), "notify_end": bool(row[3]), "lead": int(row[1]), "pin": bool(row[2])}
 
 
 def update_setting(chat_id: int, **changes):
@@ -250,8 +274,8 @@ def update_setting(chat_id: int, **changes):
     cfg.update(changes)
     with db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO chat_settings (chat_id, notify, lead, pin) VALUES (?, ?, ?, ?)",
-            (chat_id, int(cfg["notify"]), int(cfg["lead"]), int(cfg["pin"])),
+            "INSERT OR REPLACE INTO chat_settings (chat_id, notify, lead, pin, notify_end) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, int(cfg["notify"]), int(cfg["lead"]), int(cfg["pin"]), int(cfg["notify_end"])),
         )
 
 
@@ -623,7 +647,8 @@ def format_personal_update(grp: str, new_data: dict, old_data: dict | None, days
         if day not in new_days:
             lines.extend(diff_for_day(old_data, new_data, day))
         if ivs:
-            lines.append("Тепер: " + ", ".join(f"<code>{iv}</code>" for iv in ivs))
+            label = "Відключення" if day in new_days else "Тепер"
+            lines.append(f"{label}: " + ", ".join(f"<code>{iv}</code>" for iv in ivs))
             lines.append(f"⏱ Без світла: <b>{format_duration(calc_duration_minutes(ivs))}</b>")
         else:
             lines.append("✅ Відключень не заплановано")
@@ -684,8 +709,9 @@ def status_lines(snapshot: dict, day: str) -> list[str]:
         for g in GROUPS if g in snapshot and day in snapshot[g].get("days", {})
     }
     if totals and max(totals.values()) > 0:
-        worst = max(totals, key=totals.get)
-        lines.append(f"⏱ Найбільше без світла: <b>{worst}</b> — {format_duration(totals[worst])}")
+        top = max(totals.values())
+        worst = ", ".join(g for g in GROUPS if totals.get(g) == top)  # усі черги з однаковим максимумом
+        lines.append(f"⏱ Найбільше без світла: <b>{worst}</b> — {format_duration(top)}")
     return lines
 
 
@@ -712,13 +738,22 @@ CAPTION_TITLES = {
     "new": "🆕 <b>Опубліковано графік</b>",
     "morning": "☀️ <b>Доброго ранку! Графік на сьогодні</b>",
     "evening": "🌙 <b>Графік на завтра</b>",
-    None: "🎄 <b>Графік</b>",
 }
+SEASON_EMOJI = {"winter": "🎄", "spring": "🌷", "summer": "☀️", "autumn": "🍂"}
+
+
+def season_emoji() -> str:
+    """Значок у підписі за сезоном (той самий, що й тема картинки)."""
+    try:
+        return SEASON_EMOJI.get(current_theme(), "💡") if current_theme else "💡"
+    except Exception:
+        return "💡"
 
 
 def build_caption(snapshot: dict, day: str, focus: str | None = None, changed=None, olds=None, kind: str | None = None) -> str:
     """Текст під картинкою: що змінилось, ваша черга, хто зараз без світла."""
-    head = f"{CAPTION_TITLES.get(kind, CAPTION_TITLES[None])} · {pretty_day(day)}"
+    title = CAPTION_TITLES.get(kind) or f"{season_emoji()} <b>Графік</b>"
+    head = f"{title} · {pretty_day(day)}"
     lines = [head]
     lines += focus_lines(focus, snapshot, day)
     if kind == "update" and changed:
@@ -745,6 +780,12 @@ async def send_msg(chat_id: int, png: bytes | None, text: str, silent: bool = Fa
             logging.info(f"Чат {chat_id} заблокував бота / бота видалено, видаляю підписку.")
             remove_subscription(chat_id)
             return None
+        except TelegramMigrateToChat as e:
+            new_id = getattr(e, "migrate_to_chat_id", None)
+            if not new_id:
+                return None
+            migrate_chat(chat_id, new_id)
+            chat_id = new_id  # повторюємо вже в новий чат
         except TelegramRetryAfter as e:
             logging.warning(f"Flood control при надсиланні в {chat_id}, чекаю {e.retry_after}с")
             await asyncio.sleep(e.retry_after + 1)
@@ -765,6 +806,8 @@ async def safe_send_photo(chat_id: int, png: bytes, caption: str) -> bool:
 async def track_and_pin(chat_id: int, day: str, new_id: int, pin: bool):
     """Запам'ятовує свіжу картинку дня, за потреби закріплює її, а стару (цього ж дня) відкріплює й видаляє."""
     old_id = get_pin(chat_id, day)
+    if pin and PIN_SCHEDULE and not get_chat_pins(chat_id):
+        await cleanup_orphan_pins(chat_id)  # база могла загубитись (деплой без диска) — прибираємо старі закріплення бота
     if pin:
         try:
             await bot.pin_chat_message(chat_id, new_id, disable_notification=True)
@@ -792,10 +835,53 @@ async def publish(chat_id: int, day: str, png: bytes | None, text: str,
     msg = await send_msg(chat_id, png, text, silent=silent)
     if msg is None:
         return False
+    chat_id = msg.chat.id  # міг змінитись після міграції групи в супергрупу
     if managed or force_pin:
         pin = PIN_SCHEDULE and (force_pin or get_settings(chat_id)["pin"])
         await track_and_pin(chat_id, day, msg.message_id, pin)
     return True
+
+
+async def cleanup_orphan_pins(chat_id: int, limit: int = 6):
+    """Якщо бот не пам'ятає своїх закріплень (нова/стерта база), але в чаті ще висять його старі графіки —
+    відкріплює (і видаляє) їх. Чужі закріплення (не від бота) не чіпає: зупиняється на першому такому."""
+    try:
+        me = await bot.me()
+    except TelegramAPIError:
+        return
+    keep = {mid for _, mid in get_chat_pins(chat_id)}
+    for _ in range(limit):
+        try:
+            chat = await bot.get_chat(chat_id)
+        except TelegramAPIError:
+            return
+        pm = getattr(chat, "pinned_message", None)
+        if not pm or not pm.from_user or pm.from_user.id != me.id or pm.message_id in keep:
+            return
+        try:
+            await bot.unpin_chat_message(chat_id, message_id=pm.message_id)
+        except TelegramAPIError:
+            return
+        if REPLACE_OLD:
+            try:
+                await bot.delete_message(chat_id, pm.message_id)
+            except TelegramAPIError:
+                pass
+
+
+async def release_chat_pins(chat_id: int):
+    """Відписка від чату: відкріплює (і за DELETE_EXPIRED видаляє) графіки бота, щоб вони не висіли вічно."""
+    for day, msg_id in get_chat_pins(chat_id):
+        try:
+            await bot.unpin_chat_message(chat_id, message_id=msg_id)
+        except TelegramAPIError:
+            pass
+        if DELETE_EXPIRED:
+            try:
+                await bot.delete_message(chat_id, msg_id)
+            except TelegramAPIError:
+                pass
+        delete_pin_row(chat_id, day)
 
 
 async def apply_pin_setting(chat_id: int, enable: bool):
@@ -834,7 +920,7 @@ async def expire_old_pins():
 
 
 async def pin_hint(chat_id: int) -> str:
-    """Підказка в групі, якщо в бота немає прав закріплювати."""
+    """Підказка в групі, якщо боту бракує прав закріплювати / видаляти старі версії."""
     if not PIN_SCHEDULE:
         return ""
     try:
@@ -842,12 +928,16 @@ async def pin_hint(chat_id: int) -> str:
         member = await bot.get_chat_member(chat_id, me.id)
     except TelegramAPIError:
         return ""
-    if member.status == "administrator" and getattr(member, "can_pin_messages", False):
+    is_admin = member.status in ("administrator", "creator")
+    missing = []
+    if not is_admin or not (member.status == "creator" or getattr(member, "can_pin_messages", False)):
+        missing.append("«Закріплення повідомлень»")
+    if REPLACE_OLD and (not is_admin or not (member.status == "creator" or getattr(member, "can_delete_messages", False))):
+        missing.append("«Видалення повідомлень» (щоб прибирати старі версії)")
+    if not missing:
         return ""
-    return (
-        "\n\n📌 Щоб я закріплював свіжий графік, зроби мене адміном із правами "
-        "«Закріплення повідомлень» і «Видалення повідомлень» (щоб прибирати старі версії)."
-    )
+    who = "зроби мене адміном із правами" if not is_admin else "додай мені права"
+    return "\n\n📌 Щоб я закріплював свіжий графік, " + who + " " + " і ".join(missing) + "."
 
 
 async def make_card(group_name: str, data: dict, is_update: bool) -> bytes | None:
@@ -916,13 +1006,15 @@ async def reminders_loop():
                 spans = outage_spans(saved)
                 for chat_id, _ in subscribers:
                     cfg = get_settings(chat_id)
-                    if not cfg["notify"]:
+                    want_start = cfg["notify"]
+                    want_end = REMIND_END and cfg["notify_end"]
+                    if not (want_start or want_end):
                         continue
                     lead = timedelta(minutes=cfg["lead"])
 
                     for start, end in spans:
                         # перед вимкненням
-                        if start - lead <= now < start:
+                        if want_start and start - lead <= now < start:
                             key = f"{chat_id}:{grp}:start:{start:%Y%m%d%H%M}"
                             if not was_reminder_sent(key):
                                 left = max(1, round((start - now).total_seconds() / 60))
@@ -935,7 +1027,7 @@ async def reminders_loop():
                                     mark_reminder_sent(key)
 
                         # перед поверненням світла
-                        if REMIND_END and start < now and end - lead <= now < end:
+                        if want_end and start < now and end - lead <= now < end:
                             key = f"{chat_id}:{grp}:end:{end:%Y%m%d%H%M}"
                             if not was_reminder_sent(key):
                                 left = max(1, round((end - now).total_seconds() / 60))
@@ -982,21 +1074,63 @@ async def send_digest(day: str, kind: str):
         await asyncio.sleep(0.1)
 
 
+async def edit_card(chat_id: int, day: str, msg_id: int, png: bytes | None, caption: str) -> bool:
+    """Тихо редагує вже опубліковане повідомлення (картинка + підпис). Нове повідомлення НЕ створюється."""
+    for _ in range(2):
+        try:
+            if png:
+                await bot.edit_message_media(
+                    media=InputMediaPhoto(
+                        media=BufferedInputFile(png, filename="schedule.png"), caption=caption, parse_mode="HTML"
+                    ),
+                    chat_id=chat_id, message_id=msg_id,
+                )
+            else:
+                try:
+                    await bot.edit_message_text(caption, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+                except TelegramBadRequest as e:
+                    if "no text in the message" not in str(e):
+                        raise
+                    await bot.edit_message_caption(chat_id=chat_id, message_id=msg_id, caption=caption, parse_mode="HTML")
+            return True
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramForbiddenError:
+            return False
+        except TelegramBadRequest as e:
+            text = str(e).lower()
+            if "not modified" in text:
+                return True
+            if "not found" in text or "can't be edited" in text:  # повідомлення видалили вручну
+                delete_pin_row(chat_id, day)
+            logging.info(f"Не вдалось відредагувати {msg_id} в {chat_id}: {e}")
+            return False
+        except Exception as e:
+            logging.warning(f"Помилка редагування {msg_id} в {chat_id}: {e}")
+            return False
+    return False
+
+
 async def refresh_cards_after_midnight():
-    """Тихо замінює закріплені картинки, щоб після півночі «ЗАВТРА» стало «СЬОГОДНІ». Без сповіщень."""
+    """Після півночі НІЧОГО не надсилаємо: уже опубліковані картинки (що були «завтра») тихо оновлюються
+    на місці — міняється підпис («сьогодні»), позначка «зараз» і час оновлення на картинці."""
     snapshot = get_all_saved()
     if not snapshot:
         return
-    all_days = {d for v in snapshot.values() for d in v.get("days", {})}
-    days = upcoming_days(all_days)
-    if not days:  # на нову дату графіка ще нема — нічого не надсилаємо
-        return
-    pngs = {day: await make_overview(snapshot, day, set(), False) for day in days}
-    for chat_id, grp in get_group_chats():
-        for day in days:
-            caption = build_caption(snapshot, day, focus=grp if grp in GROUPS else None)
-            await publish(chat_id, day, pngs.get(day), caption, managed=True, silent=True)
-            await asyncio.sleep(0.1)
+    focus = dict(get_group_chats())  # chat_id -> черга/all
+    pngs: dict[str, bytes | None] = {}
+    for chat_id, day, msg_id in get_all_pins():
+        d = parse_day(day)
+        if d is None or d < date.today() or chat_id not in focus:
+            continue  # вчорашні прибере expire_old_pins
+        if not any(day in v.get("days", {}) for v in snapshot.values()):
+            continue
+        if day not in pngs:
+            pngs[day] = await make_overview(snapshot, day, set(), False)
+        grp = focus[chat_id]
+        caption = build_caption(snapshot, day, focus=grp if grp in GROUPS else None)
+        await edit_card(chat_id, day, msg_id, pngs[day], caption)
+        await asyncio.sleep(0.1)
 
 
 async def digest_loop():
@@ -1006,6 +1140,16 @@ async def digest_loop():
                 rollover_key = f"rollover:{date.today():%Y%m%d}"
                 if not was_reminder_sent(rollover_key):
                     mark_reminder_sent(rollover_key)
+                    if get_all_pins():
+                        await refresh_cards_after_midnight()
+                    STATUS["last_refresh"] = time.monotonic()
+
+            # періодичне тихе оновлення закріплених картинок/підписів (статус «зараз» не застаріває)
+            if STATUS_REFRESH_MINUTES > 0 and ROLLOVER_REFRESH:
+                if STATUS.get("last_refresh") is None:
+                    STATUS["last_refresh"] = time.monotonic()
+                elif time.monotonic() - STATUS["last_refresh"] >= STATUS_REFRESH_MINUTES * 60:
+                    STATUS["last_refresh"] = time.monotonic()
                     if get_all_pins():
                         await refresh_cards_after_midnight()
 
@@ -1400,18 +1544,22 @@ def settings_view(chat_id: int, is_private: bool) -> tuple[str, InlineKeyboardMa
     else:
         lines += [f"📍 Черга: <b>{sub[1]}</b>", ""]
 
-    if cfg["notify"]:
-        lines.append(f"🔔 Нагадую <b>за {cfg['lead']} хв</b> до вимкнення і до повернення світла")
-    else:
-        lines.append("🔕 Нагадування вимкнено (оновлення графіка все одно приходять)")
+    lines.append("⏳ Перед вимкненням: " + (f"<b>за {cfg['lead']} хв</b>" if cfg["notify"] else "не нагадую"))
+    if REMIND_END:
+        lines.append("💡 Перед ввімкненням: " + (f"<b>за {cfg['lead']} хв</b>" if cfg["notify_end"] else "не нагадую"))
+    lines.append("<i>Оновлення графіка приходять завжди.</i>")
 
     kb = [[InlineKeyboardButton(
         text="🔁 Змінити чергу" if sub else "➕ Обрати чергу", callback_data="cfg:queue"
     )]]
     kb.append([InlineKeyboardButton(
-        text="🔔 Сповіщати: так ✅" if cfg["notify"] else "🔕 Сповіщати: ні ❌", callback_data="cfg:notify"
+        text="⏳ Вимкнення: так ✅" if cfg["notify"] else "⏳ Вимкнення: ні ❌", callback_data="cfg:notify"
     )])
-    if cfg["notify"]:
+    if REMIND_END:
+        kb.append([InlineKeyboardButton(
+            text="💡 Ввімкнення: так ✅" if cfg["notify_end"] else "💡 Ввімкнення: ні ❌", callback_data="cfg:notify_end"
+        )])
+    if cfg["notify"] or (REMIND_END and cfg["notify_end"]):
         kb.append([
             InlineKeyboardButton(
                 text=f"✅ за {m} хв" if m == cfg["lead"] else f"за {m} хв", callback_data=f"cfg:lead:{m}"
@@ -1485,6 +1633,8 @@ async def cb_settings(callback: types.CallbackQuery):
     toast: str | None = "Збережено"
     if action == "notify":
         update_setting(chat.id, notify=not cfg["notify"])
+    elif action == "notify_end" and REMIND_END:
+        update_setting(chat.id, notify_end=not cfg["notify_end"])
     elif action == "lead" and len(parts) == 3 and parts[2].isdigit() and int(parts[2]) in LEAD_OPTIONS:
         update_setting(chat.id, lead=int(parts[2]))
     elif action == "pin" and not is_private:
@@ -1504,6 +1654,7 @@ async def cb_settings(callback: types.CallbackQuery):
     elif action == "back":
         toast = None
     elif action == "stop":
+        await release_chat_pins(chat.id)
         remove_subscription(chat.id)
         toast = "Відписано"
     else:
@@ -1575,6 +1726,8 @@ def status_text() -> str:
         lines.append(
             f"⚠️ Помилок поспіль: <b>{s['consecutive_errors']}</b> — <code>{html.escape(s['last_error_text'])}</code>"
         )
+    if current_theme:
+        lines.append(f"🎨 Тема картинок: {THEMES[current_theme()]['ua']}")
     priv, grp = count_subscribers()
     lines.append(f"👥 Підписано: {priv} особистих, {grp} групових чатів")
     lines.append(f"⏱ Працюю: {format_duration(int((now - s['started']).total_seconds() // 60))}")
@@ -1708,6 +1861,12 @@ async def on_service_pin(message: types.Message):
         pass
 
 
+@dp.message(F.migrate_to_chat_id)
+async def on_group_migrated(message: types.Message):
+    """Група стала супергрупою — переносимо підписку на новий id."""
+    migrate_chat(message.chat.id, message.migrate_to_chat_id)
+
+
 @dp.message(Command("all"))
 async def cmd_all(message: types.Message):
     if not get_all_saved():
@@ -1747,6 +1906,7 @@ async def cmd_stop(message: types.Message):
         await message.answer("Відписати чат можуть лише адміни.")
         return
     if get_subscription(message.chat.id):
+        await release_chat_pins(message.chat.id)
         remove_subscription(message.chat.id)
         await message.answer("🔕 Сповіщення вимкнено. Щоб підписатись знову — /start.")
     else:

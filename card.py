@@ -1,4 +1,4 @@
-"""Генерація новорічної картинки з графіком відключень (Pillow)."""
+"""Генерація сезонної (зима/весна/літо/осінь) картинки з графіком відключень (Pillow)."""
 import io
 import math
 import os
@@ -69,49 +69,196 @@ def _fmt_dur(minutes: int) -> str:
     return f"{m} хв"
 
 
-def _background(height: int, seed: int) -> Image.Image:
-    bg = Image.new("RGB", (W, height))
+# ---------------------------------------------------------------- Сезонні теми
+# Сезон змінюється автоматично за датою (за замовчуванням — 1 грудня / 1 березня / 1 червня / 1 вересня).
+# Примусово: змінна середовища THEME=winter|spring|summer|autumn.
+SEASON_STARTS = [(3, 1, "spring"), (6, 1, "summer"), (9, 1, "autumn"), (12, 1, "winter")]
+
+THEMES = {
+    "winter": {
+        "name": "winter", "ua": "зимова", "top": (8, 18, 46), "bottom": (22, 58, 98),
+        "accent": (255, 214, 70, 255), "tint": (170, 205, 240, 255), "tint2": (150, 185, 225, 255),
+        "tint3": (200, 220, 240, 255), "bokeh": (255, 255, 255, 70), "greeting": "Теплої зими!",
+    },
+    "spring": {
+        "name": "spring", "ua": "весняна", "top": (14, 42, 72), "bottom": (40, 112, 122),
+        "accent": (255, 190, 215, 255), "tint": (190, 225, 235, 255), "tint2": (165, 205, 215, 255),
+        "tint3": (215, 238, 240, 255), "bokeh": (255, 200, 225, 60), "greeting": "Гарної весни!",
+    },
+    "summer": {
+        "name": "summer", "ua": "літня", "top": (10, 58, 118), "bottom": (24, 120, 160),
+        "accent": (255, 208, 64, 255), "tint": (185, 225, 245, 255), "tint2": (160, 205, 230, 255),
+        "tint3": (210, 235, 248, 255), "bokeh": (255, 232, 150, 60), "greeting": "Гарного літа!",
+    },
+    "autumn": {
+        "name": "autumn", "ua": "осіння", "top": (38, 18, 14), "bottom": (112, 54, 26),
+        "accent": (255, 166, 64, 255), "tint": (245, 212, 175, 255), "tint2": (225, 185, 150, 255),
+        "tint3": (250, 228, 205, 255), "bokeh": (255, 170, 80, 55), "greeting": "Затишної осені!",
+    },
+}
+
+
+def current_theme(now: datetime | None = None, override: str | None = None) -> str:
+    """Назва теми: з параметра/змінної THEME, інакше за датою."""
+    name = (override or os.getenv("THEME", "")).strip().lower()
+    if name in THEMES:
+        return name
+    now = now or datetime.now()
+    cur = "winter"  # з 1 грудня і до 28/29 лютого (до початку весни)
+    for m, d, n in SEASON_STARTS:
+        if (now.month, now.day) >= (m, d):
+            cur = n
+    return cur
+
+
+def _greeting(th: dict, now: datetime) -> str:
+    if th["name"] == "winter" and (now.month == 12 or (now.month == 1 and now.day <= 15)):
+        return "Гарних і світлих свят!"
+    return th["greeting"]
+
+
+def _rot_ellipse(cx, cy, rx, ry, ang, n=14):
+    ca, sa = math.cos(ang), math.sin(ang)
+    pts = []
+    for i in range(n):
+        t = 2 * math.pi * i / n
+        x, y = rx * math.cos(t), ry * math.sin(t)
+        pts.append((cx + x * ca - y * sa, cy + x * sa + y * ca))
+    return pts
+
+
+def _leaf(d, cx, cy, size, ang, color, vein=True):
+    """Листок-«мигдалина» довжиною 2*size, повернутий на ang (радіани)."""
+    n = 10
+    ca, sa = math.cos(ang), math.sin(ang)
+    prof = [(-size + 2 * size * i / n, size * 0.5 * math.sin(math.pi * i / n)) for i in range(n + 1)]
+    pts = prof + [(x, -w) for x, w in reversed(prof)]
+    d.polygon([(cx + x * ca - y * sa, cy + x * sa + y * ca) for x, y in pts], fill=color)
+    if vein:
+        vc = tuple(int(c * 0.65) for c in color[:3]) + (color[3],)
+        d.line([(cx - size * ca * 0.9, cy - size * sa * 0.9), (cx + size * ca * 0.9, cy + size * sa * 0.9)], fill=vc, width=1)
+
+
+def _sparkle(d, x, y, r, color):
+    pts = []
+    for k in range(8):
+        a = math.radians(k * 45)
+        rr = r if k % 2 == 0 else r * 0.28
+        pts.append((x + rr * math.cos(a), y + rr * math.sin(a)))
+    d.polygon(pts, fill=color)
+
+
+def _blossom(d, x, y, r, color):
+    for k in range(5):
+        a = math.radians(k * 72 - 90)
+        px_, py_ = x + r * 0.75 * math.cos(a), y + r * 0.75 * math.sin(a)
+        d.ellipse([px_ - r * 0.55, py_ - r * 0.55, px_ + r * 0.55, py_ + r * 0.55], fill=color)
+    d.ellipse([x - r * 0.3, y - r * 0.3, x + r * 0.3, y + r * 0.3], fill=(255, 205, 70, 255))
+
+
+def _background(width: int, height: int, seed: int, th: dict) -> Image.Image:
+    bg = Image.new("RGB", (width, height))
     px = ImageDraw.Draw(bg)
-    top, bottom = (8, 18, 46), (22, 58, 98)
+    top, bottom = th["top"], th["bottom"]
     for y in range(height):
         t = y / max(1, height - 1)
-        px.line([(0, y), (W, y)], fill=tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3)))
+        px.line([(0, y), (width, y)], fill=tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3)))
 
     rnd = random.Random(seed)
-    snow = Image.new("RGBA", (W, height), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(snow)
-    for _ in range(int(height / 7)):
-        x, y = rnd.randint(0, W), rnd.randint(0, height)
-        r = rnd.choice([1, 1, 2, 2, 3, 4])
-        a = rnd.randint(90, 230)
-        sd.ellipse([x - r, y - r, x + r, y + r], fill=(255, 255, 255, a))
-    big = Image.new("RGBA", (W, height), (0, 0, 0, 0))
+    parts = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(parts)
+    kind = th["name"]
+    if kind == "winter":  # сніг
+        for _ in range(int(height / 7)):
+            x, y = rnd.randint(0, width), rnd.randint(0, height)
+            r = rnd.choice([1, 1, 2, 2, 3, 4])
+            a = rnd.randint(90, 230)
+            sd.ellipse([x - r, y - r, x + r, y + r], fill=(255, 255, 255, a))
+    elif kind == "spring":  # пелюстки
+        palette = [(255, 183, 208), (255, 214, 229), (255, 255, 255), (250, 160, 190)]
+        for _ in range(int(height / 20)):
+            x, y = rnd.randint(0, width), rnd.randint(0, height)
+            s = rnd.randint(5, 10)
+            sd.polygon(_rot_ellipse(x, y, s, s * 0.55, rnd.uniform(0, math.pi)), fill=rnd.choice(palette) + (rnd.randint(150, 230),))
+    elif kind == "summer":  # сонячні відблиски
+        for _ in range(int(height / 14)):
+            x, y = rnd.randint(0, width), rnd.randint(0, height)
+            if rnd.random() < 0.3:
+                _sparkle(sd, x, y, rnd.randint(5, 9), (255, 244, 190, rnd.randint(120, 220)))
+            else:
+                r = rnd.choice([1, 2, 2, 3])
+                sd.ellipse([x - r, y - r, x + r, y + r], fill=(255, 248, 210, rnd.randint(90, 200)))
+    else:  # осіннє листя
+        palette = [(230, 120, 30), (200, 60, 30), (240, 170, 50), (150, 70, 30)]
+        for _ in range(int(height / 38)):
+            x, y = rnd.randint(0, width), rnd.randint(0, height)
+            _leaf(sd, x, y, rnd.randint(8, 15), rnd.uniform(0, 2 * math.pi), rnd.choice(palette) + (rnd.randint(190, 240),))
+
+    big = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     bd = ImageDraw.Draw(big)
     for _ in range(14):
-        x, y = rnd.randint(0, W), rnd.randint(0, height)
+        x, y = rnd.randint(0, width), rnd.randint(0, height)
         r = rnd.randint(5, 9)
-        bd.ellipse([x - r, y - r, x + r, y + r], fill=(255, 255, 255, 70))
+        bd.ellipse([x - r, y - r, x + r, y + r], fill=th["bokeh"])
     big = big.filter(ImageFilter.GaussianBlur(3))
     bg = Image.alpha_composite(bg.convert("RGBA"), big)
-    bg = Image.alpha_composite(bg, snow)
-    return bg
+    return Image.alpha_composite(bg, parts)
 
 
-def _garland(img: Image.Image):
+def _decor_top(img: Image.Image, th: dict) -> Image.Image:
+    """Верхня прикраса: гірлянда / квітуча гілка / прапорці / осіння гілка."""
+    w = img.size[0]
     glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
     d = ImageDraw.Draw(img)
-    pts = [(x, 30 + 22 * math.sin(x / 90)) for x in range(-10, W + 20, 6)]
-    d.line(pts, fill=(40, 70, 60, 255), width=4)
-    for i, x in enumerate(range(20, W, 64)):
-        y = 30 + 22 * math.sin(x / 90)
-        c = BULB_COLORS[i % len(BULB_COLORS)]
-        gd.ellipse([x - 20, y + 4, x + 20, y + 44], fill=c + (120,))
-        d.line([(x, y), (x, y + 10)], fill=(40, 70, 60, 255), width=3)
-        d.ellipse([x - 8, y + 10, x + 8, y + 34], fill=c + (255,))
-        d.ellipse([x - 4, y + 14, x, y + 20], fill=(255, 255, 255, 190))
+    kind = th["name"]
+
+    if kind == "winter":
+        pts = [(x, 30 + 22 * math.sin(x / 90)) for x in range(-10, w + 20, 6)]
+        d.line(pts, fill=(40, 70, 60, 255), width=4)
+        for i, x in enumerate(range(20, w, 64)):
+            y = 30 + 22 * math.sin(x / 90)
+            c = BULB_COLORS[i % len(BULB_COLORS)]
+            gd.ellipse([x - 20, y + 4, x + 20, y + 44], fill=c + (120,))
+            d.line([(x, y), (x, y + 10)], fill=(40, 70, 60, 255), width=3)
+            d.ellipse([x - 8, y + 10, x + 8, y + 34], fill=c + (255,))
+            d.ellipse([x - 4, y + 14, x, y + 20], fill=(255, 255, 255, 190))
+
+    elif kind == "spring":
+        rnd = random.Random(11)
+        greens = [(110, 190, 110, 255), (150, 210, 120, 255), (90, 170, 120, 255)]
+        petals = [(255, 183, 208, 255), (255, 225, 235, 255), (250, 150, 185, 255)]
+        d.line([(x, 28 + 20 * math.sin(x / 110)) for x in range(-10, w + 20, 6)], fill=(96, 64, 48, 255), width=6)
+        for i, x in enumerate(range(10, w, 44)):
+            y = 28 + 20 * math.sin(x / 110)
+            side = 1 if i % 2 == 0 else -1
+            _leaf(d, x + 8, y + side * 14, 15, math.radians(side * 55 + rnd.randint(-15, 15)), greens[i % 3])
+        for i, x in enumerate(range(40, w, 118)):
+            y = 28 + 20 * math.sin(x / 110)
+            c = petals[i % 3]
+            d.line([(x, y), (x, y + 12)], fill=(96, 64, 48, 255), width=3)
+            gd.ellipse([x - 28, y + 6, x + 28, y + 62], fill=c[:3] + (90,))
+            _blossom(d, x, y + 24, 15, c)
+
+    elif kind == "summer":
+        cols = [(255, 200, 60, 255), (255, 112, 112, 255), (255, 255, 255, 255), (64, 224, 208, 255)]
+        f = lambda x: 22 + 16 * math.sin(x / 120)
+        d.line([(x, f(x)) for x in range(-10, w + 20, 6)], fill=(235, 235, 235, 255), width=3)
+        for i, x in enumerate(range(24, w, 62)):
+            d.polygon([(x - 22, f(x - 22)), (x + 22, f(x + 22)), (x, f(x) + 48)], fill=cols[i % 4])
+
+    else:  # autumn
+        rnd = random.Random(5)
+        cols = [(230, 120, 30, 255), (200, 60, 30, 255), (240, 170, 50, 255), (170, 90, 35, 255)]
+        f = lambda x: 26 + 18 * math.sin(x / 100)
+        d.line([(x, f(x)) for x in range(-10, w + 20, 6)], fill=(84, 52, 34, 255), width=6)
+        for i, x in enumerate(range(24, w, 52)):
+            y = f(x)
+            d.line([(x, y), (x, y + 10)], fill=(84, 52, 34, 255), width=2)
+            _leaf(d, x, y + 28, 19, math.radians(90 + rnd.randint(-25, 25)), cols[i % 4])
+
     glow = glow.filter(ImageFilter.GaussianBlur(9))
-    return Image.alpha_composite(img, glow), True
+    return Image.alpha_composite(img, glow)
 
 
 def _tree(layer: Image.Image, cx: int, base_y: int, scale: float = 1.0):
@@ -138,11 +285,62 @@ def _tree(layer: Image.Image, cx: int, base_y: int, scale: float = 1.0):
         d.ellipse([bx - 6, by - 6, bx + 6, by + 6], fill=c + (255,))
 
 
+def _tulips(layer, cx, base_y, s):
+    d = ImageDraw.Draw(layer)
+    for dx, h, col, light in [(-44, 95, (240, 80, 110, 255), (255, 125, 150, 255)),
+                              (0, 140, (255, 196, 60, 255), (255, 224, 110, 255)),
+                              (44, 110, (230, 100, 190, 255), (250, 150, 215, 255))]:
+        sx, top_y = cx + dx * s, base_y - h * s
+        d.line([(sx, base_y + 22 * s), (sx, top_y)], fill=(70, 170, 90, 255), width=max(3, int(6 * s)))
+        side = -1 if dx <= 0 else 1
+        _leaf(d, sx + side * 16 * s, base_y - h * 0.3 * s, 36 * s, math.radians(-60 * side), (70, 170, 90, 255))
+        r = 21 * s
+        d.ellipse([sx - r, top_y - r * 1.1, sx + r, top_y + r * 1.1], fill=col)
+        d.polygon([(sx - r, top_y - r * 0.2), (sx - r * 0.95, top_y - r * 1.6), (sx - r * 0.35, top_y - r * 0.75),
+                   (sx, top_y - r * 1.8), (sx + r * 0.35, top_y - r * 0.75), (sx + r * 0.95, top_y - r * 1.6),
+                   (sx + r, top_y - r * 0.2)], fill=light)
+
+
+def _sun(layer, cx, base_y, s):
+    d = ImageDraw.Draw(layer)
+    cy, r = base_y - 85 * s, 44 * s
+    for k, a in enumerate((34, 48, 70)):
+        rr = r + (46 - k * 14) * s
+        d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=(255, 220, 100, a))
+    for k in range(16):
+        ang = math.radians(k * 22.5)
+        length = (34 if k % 2 == 0 else 22) * s
+        w = 7 * s
+        p0, p1 = r + 8 * s, r + 8 * s + length
+        ca, sa = math.cos(ang), math.sin(ang)
+        d.polygon([(cx + p0 * ca - w * sa, cy + p0 * sa + w * ca), (cx + p0 * ca + w * sa, cy + p0 * sa - w * ca),
+                   (cx + p1 * ca, cy + p1 * sa)], fill=(255, 214, 70, 255))
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 196, 48, 255))
+    d.ellipse([cx - r * 0.78, cy - r * 0.78, cx + r * 0.78, cy + r * 0.78], fill=(255, 224, 108, 255))
+
+
+def _pumpkin(layer, cx, base_y, s):
+    d = ImageDraw.Draw(layer)
+    cy = base_y - 30 * s
+    for dx, rx, col in [(-42, 38, (206, 96, 22, 255)), (42, 38, (206, 96, 22, 255)),
+                        (-21, 38, (226, 120, 32, 255)), (21, 38, (226, 120, 32, 255)),
+                        (0, 34, (244, 146, 48, 255))]:
+        d.ellipse([cx + (dx - rx) * s, cy - 46 * s, cx + (dx + rx) * s, cy + 46 * s], fill=col, outline=(150, 66, 14, 255), width=2)
+    d.polygon([(cx - 7 * s, cy - 44 * s), (cx + 7 * s, cy - 44 * s), (cx + 4 * s, cy - 66 * s), (cx - 4 * s, cy - 66 * s)], fill=(96, 64, 36, 255))
+    _leaf(d, cx + 26 * s, cy - 54 * s, 22 * s, math.radians(-25), (130, 160, 56, 255))
+
+
+def _hero(th: dict, layer: Image.Image, cx: int, base_y: int, scale: float = 1.0):
+    """Головна ілюстрація в шапці: ялинка / тюльпани / сонце / гарбуз."""
+    {"winter": _tree, "spring": _tulips, "summer": _sun, "autumn": _pumpkin}[th["name"]](layer, cx, base_y, scale)
+
+
 def _rounded(d, box, r, fill, outline=None, width=1):
     d.rounded_rectangle(box, radius=r, fill=fill, outline=outline, width=width)
 
 
-def render_schedule_card(group_name: str, data: dict, is_update: bool = False) -> bytes:
+def render_schedule_card(group_name: str, data: dict, is_update: bool = False, theme: str | None = None) -> bytes:
+    th = THEMES[current_theme(override=theme)]
     f_title = _font(FONT_BOLD, 58)
     f_sub = _font(FONT_BOLD, 40)
     f_day = _font(FONT_BOLD, 38)
@@ -163,11 +361,11 @@ def render_schedule_card(group_name: str, data: dict, is_update: bool = False) -
         y += 58
     d.text((PAD, y), "Графік відключень", font=f_title, fill=(255, 255, 255, 255))
     y += 78
-    d.text((PAD, y), f"Черга {group_name}", font=f_sub, fill=(255, 214, 70, 255))
+    d.text((PAD, y), f"Черга {group_name}", font=f_sub, fill=th["accent"])
     y += 56
-    d.text((PAD, y), "Гарних і світлих свят!", font=f_txt, fill=(170, 205, 240, 255))
+    d.text((PAD, y), _greeting(th, datetime.now()), font=f_txt, fill=th["tint"])
     header_bottom = y + 50
-    _tree(layer, W - 170, header_bottom - 40, 1.0)
+    _hero(th, layer, W - 170, header_bottom - 40, 1.0)
 
     y = max(header_bottom, 340)
 
@@ -219,7 +417,7 @@ def render_schedule_card(group_name: str, data: dict, is_update: bool = False) -
             lbl = f"{h:02d}"
             lw = d.textlength(lbl, font=f_small)
             tx_text = min(max(tx - lw / 2, bx0 - 4), bx1 - lw + 4)
-            d.text((tx_text, by0 + 44), lbl, font=f_small, fill=(170, 205, 240, 255))
+            d.text((tx_text, by0 + 44), lbl, font=f_small, fill=th["tint"])
 
         # чипи з інтервалами
         cy = by0 + 86
@@ -240,12 +438,12 @@ def render_schedule_card(group_name: str, data: dict, is_update: bool = False) -
 
     # --- підвал
     stamp = datetime.now().strftime("Оновлено %d.%m.%Y о %H:%M")
-    d.text((PAD, y + 6), stamp, font=f_small, fill=(150, 185, 225, 255))
+    d.text((PAD, y + 6), stamp, font=f_small, fill=th["tint2"])
     total_h = y + 70
 
     layer = layer.crop((0, 0, W, total_h))
-    img = _background(total_h, seed=hash(group_name) & 0xFFFF)
-    img, _ = _garland(img)
+    img = _background(W, total_h, sum(map(ord, group_name)), th)
+    img = _decor_top(img, th)
     img = Image.alpha_composite(img, layer).convert("RGB")
 
     buf = io.BytesIO()
@@ -289,8 +487,10 @@ def _day_title(day_label: str) -> str:
         return day_label
 
 
-def render_overview_card(all_data: dict, day_label: str, changed=None, is_update: bool = False) -> bytes:
+def render_overview_card(all_data: dict, day_label: str, changed=None, is_update: bool = False,
+                         theme: str | None = None) -> bytes:
     """all_data: {"5.1": {"days": {"24.11.2026": {"intervals": [...]}}}, ...}"""
+    th = THEMES[current_theme(override=theme)]
     changed = set(changed or [])
     f_title = _font(FONT_BOLD, 56)
     f_sub = _font(FONT_BOLD, 34)
@@ -317,9 +517,9 @@ def render_overview_card(all_data: dict, day_label: str, changed=None, is_update
         y += 56
     d.text((OPAD, y), "Графік відключень", font=f_title, fill=(255, 255, 255, 255))
     y += 76
-    d.text((OPAD, y), f"Львівська область  •  {_day_title(day_label)}", font=f_sub, fill=(255, 214, 70, 255))
+    d.text((OPAD, y), f"Львівська область  •  {_day_title(day_label)}", font=f_sub, fill=th["accent"])
     y += 58
-    _tree(layer, OW - 130, 270, 0.75)
+    _hero(th, layer, OW - 130, 270, 0.75)
     grid_y = max(y + 14, 300)
 
     # --- підготовка даних клітинок
@@ -344,14 +544,14 @@ def render_overview_card(all_data: dict, day_label: str, changed=None, is_update
             is_changed = g in changed
             _rounded(
                 d, (x, y, x + cell_w, y + row_h), 26, (255, 255, 255, 26),
-                (255, 214, 70, 255) if is_changed else (255, 255, 255, 70), 4 if is_changed else 2,
+                th["accent"] if is_changed else (255, 255, 255, 70), 4 if is_changed else 2,
             )
-            d.text((x + 22, y + 10), g, font=f_q, fill=(255, 214, 70, 255))
+            d.text((x + 22, y + 10), g, font=f_q, fill=th["accent"])
 
             if is_changed:
                 lbl = "ОНОВЛЕНО"
                 lw = d.textlength(lbl, font=f_badge) + 24
-                _rounded(d, (x + cell_w - 20 - lw, y + 20, x + cell_w - 20, y + 50), 15, (255, 214, 70, 255))
+                _rounded(d, (x + cell_w - 20 - lw, y + 20, x + cell_w - 20, y + 50), 15, th["accent"])
                 d.text((x + cell_w - 8 - lw, y + 25), lbl, font=f_badge, fill=(40, 30, 0, 255))
 
             # шкала доби
@@ -367,7 +567,7 @@ def render_overview_card(all_data: dict, day_label: str, changed=None, is_update
                     d.rounded_rectangle((bx0 + bw * s / 1440, by, bx0 + bw * e / 1440, by + 18), radius=5, fill=(230, 60, 70, 255))
             for h in (6, 12, 18):
                 tx = bx0 + bw * h / 24
-                d.line([(tx, by), (tx, by + 18)], fill=(8, 18, 46, 150), width=2)
+                d.line([(tx, by), (tx, by + 18)], fill=th["top"] + (150,), width=2)
             if is_today:
                 nx = bx0 + bw * now_min / 1440
                 d.line([(nx, by - 5), (nx, by + 23)], fill=(255, 255, 255, 255), width=3)
@@ -407,23 +607,18 @@ def render_overview_card(all_data: dict, day_label: str, changed=None, is_update
     lx = OPAD
     for color, text in (((70, 190, 110, 255), "є світло"), ((230, 60, 70, 255), "немає світла")):
         _rounded(d, (lx, ly + 4, lx + 34, ly + 22), 9, color)
-        d.text((lx + 44, ly), text, font=f_small, fill=(200, 220, 240, 255))
+        d.text((lx + 44, ly), text, font=f_small, fill=th["tint3"])
         lx += 44 + d.textlength(text, font=f_small) + 34
     if is_today:
         d.line([(lx + 8, ly), (lx + 8, ly + 26)], fill=(255, 255, 255, 255), width=3)
-        d.text((lx + 24, ly), "зараз  (крапка біля черги: зелена — світло є, червона — немає)", font=f_small, fill=(200, 220, 240, 255))
+        d.text((lx + 24, ly), "зараз  (крапка біля черги: зелена — світло є, червона — немає)", font=f_small, fill=th["tint3"])
     stamp = now.strftime("Оновлено %d.%m.%Y о %H:%M  •  poweron.loe.lviv.ua")
-    d.text((OPAD, ly + 40), stamp, font=f_small, fill=(150, 185, 225, 255))
+    d.text((OPAD, ly + 40), stamp, font=f_small, fill=th["tint2"])
     total_h = ly + 100
 
     layer = layer.crop((0, 0, OW, total_h))
-    global W
-    old_w, W = W, OW
-    try:
-        img = _background(total_h, seed=sum(map(ord, day_label)))
-        img, _ = _garland(img)
-    finally:
-        W = old_w
+    img = _background(OW, total_h, sum(map(ord, day_label)), th)
+    img = _decor_top(img, th)
     img = Image.alpha_composite(img, layer).convert("RGB")
 
     buf = io.BytesIO()
@@ -432,15 +627,15 @@ def render_overview_card(all_data: dict, day_label: str, changed=None, is_update
 
 
 if __name__ == "__main__":
+    # python card.py            — демо поточної теми; python card.py all — демо всіх чотирьох сезонів
+    import sys
+
     demo = {
         "days": {
             "24.11.2026": {"intervals": ["02:00–06:00", "10:30–14:00", "18:00–22:30"]},
             "25.11.2026": {"intervals": []},
         }
     }
-    with open("card_demo.png", "wb") as f:
-        f.write(render_schedule_card("5.1", demo, is_update=True))
-
     day = datetime.now().strftime("%d.%m.%Y")
     sample = {
         "1.1": ["08:00–12:30"], "1.2": ["19:30–22:00"], "2.1": ["22:00–00:00"], "2.2": [],
@@ -448,6 +643,11 @@ if __name__ == "__main__":
         "5.1": ["16:00–20:00"], "5.2": ["12:30–16:00"], "6.1": ["12:30–16:00"], "6.2": ["16:00–19:30"],
     }
     all_demo = {g: {"days": {day: {"intervals": iv}}} for g, iv in sample.items()}
-    with open("overview_demo.png", "wb") as f:
-        f.write(render_overview_card(all_demo, day, changed={"5.1", "6.2"}, is_update=True))
-    print("Збережено card_demo.png і overview_demo.png")
+    themes = list(THEMES) if "all" in sys.argv[1:] else [None]
+    for t in themes:
+        suffix = f"_{t}" if t else ""
+        with open(f"card_demo{suffix}.png", "wb") as f:
+            f.write(render_schedule_card("5.1", demo, is_update=True, theme=t))
+        with open(f"overview_demo{suffix}.png", "wb") as f:
+            f.write(render_overview_card(all_demo, day, changed={"5.1", "6.2"}, is_update=True, theme=t))
+    print("Збережено демо-картинки:", ", ".join(THEMES) if len(themes) > 1 else current_theme())

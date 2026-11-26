@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import html
+import io
 import json
 import logging
 import os
@@ -67,6 +69,10 @@ LOG_EVERY_CHECK = os.getenv("LOG_EVERY_CHECK", "0") == "1"           # 1 — п�
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)                        # твій Telegram id: алерти про збої/зміни сайту
 STATUS_REFRESH_MINUTES = int(os.getenv("STATUS_REFRESH_MINUTES", "30"))  # тихо оновлювати закріплені графіки («зараз без світла…»); 0 — вимкнути
 ALERT_AFTER_ERRORS = 5                                                 # скільки збійних перевірок поспіль до алерта
+
+# резервна копія бази в Telegram (для хостингів без постійного диска, напр. безкоштовний Render)
+BACKUP_NAME = "loe_bot_backup.db"
+BACKUP_ENABLED = bool(OWNER_ID) and os.getenv("BACKUP", "1") == "1"  # потрібен OWNER_ID
 
 WEEKDAYS = ["понеділок", "вівторок", "середа", "четвер", "пʼятниця", "субота", "неділя"]
 
@@ -145,6 +151,24 @@ def init_db():
                 notify_end INTEGER NOT NULL DEFAULT 1
             )
         """)
+        # додаткові черги для особистих чатів (кілька черг на одного користувача)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chat_groups (
+                chat_id INTEGER NOT NULL,
+                group_name TEXT NOT NULL,
+                PRIMARY KEY (chat_id, group_name)
+            )
+        """)
+        # що змінилось у закріпленій картинці — щоб фонове оновлення не стирало цей блок
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pin_notes (
+                chat_id INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                changes_json TEXT NOT NULL,
+                PRIMARY KEY (chat_id, day)
+            )
+        """)
         # міграція зі старої бази: нова колонка «нагадувати про ввімкнення» (спершу = старе notify)
         cols = [r[1] for r in cur.execute("PRAGMA table_info(chat_settings)").fetchall()]
         if "notify_end" not in cols:
@@ -184,6 +208,63 @@ def remove_subscription(chat_id: int):
     with db() as conn:
         conn.execute("DELETE FROM subscribers WHERE chat_id = ?", (chat_id,))
         conn.execute("DELETE FROM pinned_messages WHERE chat_id = ?", (chat_id,))
+        conn.execute("DELETE FROM chat_groups WHERE chat_id = ?", (chat_id,))
+        conn.execute("DELETE FROM pin_notes WHERE chat_id = ?", (chat_id,))
+
+
+def get_chat_groups(chat_id: int) -> list[str]:
+    """Обрані черги особистого чату (у порядку GROUPS)."""
+    with db() as conn:
+        rows = conn.execute("SELECT group_name FROM chat_groups WHERE chat_id = ?", (chat_id,)).fetchall()
+    chosen = {r[0] for r in rows}
+    if not chosen:
+        sub = get_subscription(chat_id)
+        if sub and sub[1] in GROUPS:
+            return [sub[1]]
+        return []
+    return [g for g in GROUPS if g in chosen]
+
+
+def toggle_chat_group(chat_id: int, chat_type: str, grp: str) -> list[str]:
+    """Додає/прибирає чергу в особистому чаті. Повертає оновлений список (порожній — відписано)."""
+    current = get_chat_groups(chat_id)
+    if grp in current:
+        current.remove(grp)
+    else:
+        current.append(grp)
+    current = [g for g in GROUPS if g in current]
+    with db() as conn:
+        conn.execute("DELETE FROM chat_groups WHERE chat_id = ?", (chat_id,))
+        conn.executemany("INSERT INTO chat_groups (chat_id, group_name) VALUES (?, ?)", [(chat_id, g) for g in current])
+        if current:
+            conn.execute(
+                "INSERT OR REPLACE INTO subscribers (chat_id, chat_type, group_name) VALUES (?, ?, ?)",
+                (chat_id, chat_type, current[0]),
+            )
+        else:
+            conn.execute("DELETE FROM subscribers WHERE chat_id = ?", (chat_id,))
+    return current
+
+
+def set_pin_note(chat_id: int, day: str, kind: str, changes: list[str]):
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO pin_notes (chat_id, day, kind, changes_json) VALUES (?, ?, ?, ?)",
+            (chat_id, day, kind, json.dumps(changes, ensure_ascii=False)),
+        )
+
+
+def get_pin_note(chat_id: int, day: str) -> tuple[str, list[str]] | None:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT kind, changes_json FROM pin_notes WHERE chat_id = ? AND day = ?", (chat_id, day)
+        ).fetchone()
+    return (row[0], json.loads(row[1])) if row else None
+
+
+def delete_pin_note(chat_id: int, day: str):
+    with db() as conn:
+        conn.execute("DELETE FROM pin_notes WHERE chat_id = ? AND day = ?", (chat_id, day))
 
 
 def get_subscription(chat_id: int):
@@ -194,10 +275,16 @@ def get_subscription(chat_id: int):
 
 
 def get_subscribers_by_group(group_name: str):
+    """Чати, підписані на чергу (включно з особистими, де обрано кілька черг)."""
     with db() as conn:
-        return conn.execute(
+        rows = conn.execute(
             "SELECT chat_id, chat_type FROM subscribers WHERE group_name = ?", (group_name,)
         ).fetchall()
+        extra = conn.execute(
+            "SELECT s.chat_id, s.chat_type FROM chat_groups g JOIN subscribers s ON s.chat_id = g.chat_id "
+            "WHERE g.group_name = ?", (group_name,)
+        ).fetchall()
+    return list(dict.fromkeys(rows + extra))
 
 
 def get_group_chats():
@@ -244,6 +331,7 @@ def set_pin(chat_id: int, day: str, message_id: int):
 def delete_pin_row(chat_id: int, day: str):
     with db() as conn:
         conn.execute("DELETE FROM pinned_messages WHERE chat_id = ? AND day = ?", (chat_id, day))
+        conn.execute("DELETE FROM pin_notes WHERE chat_id = ? AND day = ?", (chat_id, day))
 
 
 def get_all_pins() -> list[tuple[int, str, int]]:
@@ -566,16 +654,18 @@ def format_chat_message(group_name: str, new_data: dict, old_data: dict | None =
     return "\n".join(lines).strip()
 
 
-def get_groups_keyboard(is_private: bool = True, current: str | None = None, back: bool = False) -> InlineKeyboardMarkup:
-    """Вибір черги. current — поточна (позначається ✅); back — «Назад» замість «Налаштування»."""
+def get_groups_keyboard(is_private: bool = True, current: str | list | None = None, back: bool = False) -> InlineKeyboardMarkup:
+    """Вибір черги. current — поточна або список обраних (позначаються ✅); back — «Назад» замість «Налаштування»."""
+    chosen = set(current) if isinstance(current, (list, set, tuple)) else ({current} if current else set())
     rows = []
     for i in range(0, len(GROUPS), 4):
         rows.append([
             InlineKeyboardButton(
-                text=f"{'✅ ' if g == current else ''}Черга {g}", callback_data=f"set_grp:{g}"
+                text=f"{'✅ ' if g in chosen else ''}Черга {g}", callback_data=f"set_grp:{g}"
             )
             for g in GROUPS[i:i + 4]
         ])
+    current = "all" if "all" in chosen else None
     if not is_private:
         rows.append([InlineKeyboardButton(
             text=f"{'✅ ' if current == 'all' else ''}📊 Усі черги разом", callback_data="set_grp:all"
@@ -750,14 +840,16 @@ def season_emoji() -> str:
         return "💡"
 
 
-def build_caption(snapshot: dict, day: str, focus: str | None = None, changed=None, olds=None, kind: str | None = None) -> str:
-    """Текст під картинкою: що змінилось, ваша черга, хто зараз без світла."""
+def build_caption(snapshot: dict, day: str, focus: str | None = None, changed=None, olds=None,
+                  kind: str | None = None, saved_changes: list[str] | None = None) -> str:
+    """Текст під картинкою: що змінилось, ваша черга, хто зараз без світла.
+    saved_changes — збережений блок «що змінилось» (щоб фонове оновлення його не стирало)."""
     title = CAPTION_TITLES.get(kind) or f"{season_emoji()} <b>Графік</b>"
     head = f"{title} · {pretty_day(day)}"
     lines = [head]
     lines += focus_lines(focus, snapshot, day)
-    if kind == "update" and changed:
-        ch = compact_changes(set(changed), olds or {}, snapshot, day)
+    if kind == "update" and (changed or saved_changes):
+        ch = saved_changes if saved_changes else compact_changes(set(changed), olds or {}, snapshot, day)
         if ch:
             lines += ["", "🔄 <b>Що змінилось:</b>"] + ch
     st = status_lines(snapshot, day)
@@ -806,6 +898,7 @@ async def safe_send_photo(chat_id: int, png: bytes, caption: str) -> bool:
 async def track_and_pin(chat_id: int, day: str, new_id: int, pin: bool):
     """Запам'ятовує свіжу картинку дня, за потреби закріплює її, а стару (цього ж дня) відкріплює й видаляє."""
     old_id = get_pin(chat_id, day)
+    delete_pin_note(chat_id, day)  # нове повідомлення — старий блок «що змінилось» неактуальний
     if pin and PIN_SCHEDULE and not get_chat_pins(chat_id):
         await cleanup_orphan_pins(chat_id)  # база могла загубитись (деплой без диска) — прибираємо старі закріплення бота
     if pin:
@@ -978,8 +1071,142 @@ async def broadcast_to_group_chats(changed_by_day: dict, olds: dict, new_days: s
         for day in days:
             kind = "new" if day in new_days else "update"
             caption = build_caption(snapshot, day, focus=focus, changed=changed_by_day[day], olds=olds, kind=kind)
-            await publish(chat_id, day, pngs.get(day), caption, managed=True)
+            ok = await publish(chat_id, day, pngs.get(day), caption, managed=True)
+            if ok and kind == "update":
+                ch = compact_changes(set(changed_by_day[day]), olds, snapshot, day)
+                if ch:
+                    set_pin_note(chat_id, day, kind, ch)
             await asyncio.sleep(0.1)  # не впиратись у ліміти Telegram
+
+
+# ---------------------------------------------------------------- Бекап бази в Telegram
+
+def db_fingerprint() -> tuple[str, int] | None:
+    """(хеш вмісту бази, кількість підписаних чатів). None — база недоступна або порожня."""
+    if not os.path.exists(DB_PATH):
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        subs = conn.execute("SELECT COUNT(*) FROM subscribers").fetchone()[0]
+        digest = hashlib.sha256("\n".join(conn.iterdump()).encode("utf-8")).hexdigest()
+        return digest, subs
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def db_is_empty() -> bool:
+    fp = db_fingerprint()
+    return fp is None or fp[1] == 0
+
+
+def make_backup_bytes() -> bytes:
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(tmp)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        with open(tmp, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+async def restore_from_backup() -> bool:
+    """Якщо база порожня (новий деплой без диска) — бере закріплений бекап із чату з власником і відновлює."""
+    if not (BACKUP_ENABLED and bot):
+        return False
+    if not await asyncio.to_thread(db_is_empty):
+        return False
+    try:
+        chat = await bot.get_chat(OWNER_ID)
+        pm = getattr(chat, "pinned_message", None)
+        doc = getattr(pm, "document", None) if pm else None
+        if not doc or doc.file_name != BACKUP_NAME:
+            logging.info("Бекап для відновлення не знайдено (закріпленого файлу в чаті з власником нема).")
+            return False
+        buf = io.BytesIO()
+        await bot.download(doc, destination=buf)
+        data = buf.getvalue()
+    except Exception as e:
+        logging.warning(f"Не вдалось завантажити бекап: {e}")
+        return False
+    if not data.startswith(b"SQLite format 3\x00"):
+        logging.warning("Закріплений файл не схожий на базу SQLite, відновлення пропущено.")
+        return False
+    folder = os.path.dirname(DB_PATH)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    tmp = DB_PATH + ".restore"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, DB_PATH)
+    STATUS["backup_msg"] = pm.message_id
+    logging.info("Базу відновлено з бекапу в Telegram.")
+    return True
+
+
+async def send_backup(reason: str = "авто") -> bool:
+    """Надсилає базу власнику, закріплює нову копію, стару відкріплює й видаляє."""
+    if not BACKUP_ENABLED:
+        return False
+    try:
+        data = await asyncio.to_thread(make_backup_bytes)
+    except Exception as e:
+        logging.warning(f"Не вдалось зробити бекап: {e}")
+        return False
+    old = STATUS.get("backup_msg")
+    try:
+        msg = await bot.send_document(
+            OWNER_ID, BufferedInputFile(data, filename=BACKUP_NAME),
+            caption=f"💾 Бекап бази · {datetime.now():%d.%m %H:%M} · {reason}\nНе видаляй: з цього файлу бот відновиться після перезапуску.",
+            disable_notification=True,
+        )
+    except TelegramAPIError as e:
+        logging.warning(f"Не вдалось надіслати бекап власнику: {e} (напиши боту /start з акаунта OWNER_ID)")
+        return False
+    try:
+        await bot.pin_chat_message(OWNER_ID, msg.message_id, disable_notification=True)
+    except TelegramAPIError as e:
+        logging.warning(f"Не вдалось закріпити бекап: {e}")
+    if old and old != msg.message_id:
+        for call in (bot.unpin_chat_message(OWNER_ID, message_id=old), bot.delete_message(OWNER_ID, old)):
+            try:
+                await call
+            except TelegramAPIError:
+                pass
+    STATUS["backup_msg"] = msg.message_id
+    return True
+
+
+async def backup_loop():
+    """Раз на 20 с перевіряє, чи змінилась база; якщо так (і є підписники) — шле свіжий бекап (не частіше разу на хв)."""
+    last_hash = None
+    last_sent = 0.0
+    while True:
+        try:
+            if BACKUP_ENABLED:
+                fp = await asyncio.to_thread(db_fingerprint)
+                # порожню базу не бекапимо, щоб не затерти нею добрий бекап
+                if fp and fp[1] > 0 and fp[0] != last_hash and time.monotonic() - last_sent >= 60:
+                    if await send_backup():
+                        last_hash = fp[0]
+                    last_sent = time.monotonic()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logging.error(f"Помилка в backup_loop: {e}")
+        await asyncio.sleep(20)
 
 
 # ---------------------------------------------------------------- Background loops
@@ -1070,7 +1297,9 @@ async def send_digest(day: str, kind: str):
             caption = build_caption(snapshot, day, kind=kind)
             await publish(chat_id, day, png, caption)
         elif grp in snapshot:
-            await safe_send(chat_id, format_day_text(grp, snapshot[grp], day, f"{heading} Черга <b>{grp}</b>"))
+            for g in get_chat_groups(chat_id):
+                if g in snapshot:
+                    await safe_send(chat_id, format_day_text(g, snapshot[g], day, f"{heading} Черга <b>{g}</b>"))
         await asyncio.sleep(0.1)
 
 
@@ -1128,7 +1357,11 @@ async def refresh_cards_after_midnight():
         if day not in pngs:
             pngs[day] = await make_overview(snapshot, day, set(), False)
         grp = focus[chat_id]
-        caption = build_caption(snapshot, day, focus=grp if grp in GROUPS else None)
+        note = get_pin_note(chat_id, day)
+        caption = build_caption(
+            snapshot, day, focus=grp if grp in GROUPS else None,
+            kind=note[0] if note else None, saved_changes=note[1] if note else None,
+        )
         await edit_card(chat_id, day, msg_id, pngs[day], caption)
         await asyncio.sleep(0.1)
 
@@ -1424,7 +1657,10 @@ HELP_TEXT = (
 )
 
 
-PICK_TEXT_PRIVATE = "Обери свою фактичну чергу відключень (наприклад, <b>5.1</b>):"
+PICK_TEXT_PRIVATE = (
+    "Обери черги, про які хочеш отримувати сповіщення (можна кілька, наприклад <b>5.1</b> і <b>3.2</b>).\n"
+    "Натисни на чергу ще раз, щоб прибрати її."
+)
 PICK_TEXT_GROUP = (
     "Обери, який графік показувати в цьому чаті:\n"
     "• <b>Черга X.Y</b> — зведення по всіх чергах + деталі по обраній\n"
@@ -1455,13 +1691,18 @@ def current_group(chat_id: int) -> str | None:
     return sub[1] if sub else None
 
 
+def current_groups(chat_id: int, is_private: bool):
+    """Для особистих — список обраних черг, для груп — одна черга/all."""
+    return get_chat_groups(chat_id) if is_private else current_group(chat_id)
+
+
 @dp.message(Command("start", "group"))
 async def cmd_start(message: types.Message):
     logging.info(f"Отримано /start у чаті {message.chat.id} ({message.chat.type})")
     is_private = message.chat.type == "private"
     await message.answer(
         PICK_TEXT_PRIVATE if is_private else PICK_TEXT_GROUP,
-        reply_markup=get_groups_keyboard(is_private, current=current_group(message.chat.id)),
+        reply_markup=get_groups_keyboard(is_private, current=current_groups(message.chat.id, is_private)),
         parse_mode="HTML",
     )
 
@@ -1503,21 +1744,28 @@ async def cb_set_group(callback: types.CallbackQuery):
         await callback.answer("Змінювати чергу можуть лише адміни чату", show_alert=True)
         return
 
-    set_subscription(chat.id, chat.type, grp)
-
     if is_private:
-        saved = get_saved_schedule(grp)
-        text = f"✅ Встановлено <b>чергу {grp}</b>.\n\n"
-        if saved:
-            text += format_personal_message(grp, saved, is_update=False)
+        chosen = toggle_chat_group(chat.id, chat.type, grp)
+        if chosen:
+            text = "✅ Обрані черги: <b>" + ", ".join(chosen) + "</b>\n\n"
+            blocks = []
+            for g in chosen:
+                saved = get_saved_schedule(g)
+                if saved:
+                    blocks.append(format_personal_message(g, saved, is_update=False))
+            text += "\n\n".join(blocks) if blocks else (
+                "Дані з сайту ЛОЕ ще завантажуються, надішлю графік одразу після першої перевірки."
+            )
         else:
-            text += "Дані з сайту ЛОЕ ще завантажуються, надішлю графік одразу після першої перевірки."
+            text = "🔕 Жодної черги не обрано — сповіщення вимкнено. Обери чергу нижче."
         try:
-            await msg.edit_text(text, reply_markup=get_groups_keyboard(True, current=grp), parse_mode="HTML")
+            await msg.edit_text(text[:4000], reply_markup=get_groups_keyboard(True, current=chosen), parse_mode="HTML")
         except TelegramBadRequest:
-            pass  # "message is not modified" — натиснули ту саму чергу ще раз
-        await callback.answer(f"Обрано чергу {grp}")
+            pass
+        await callback.answer(("Додано/прибрано: " + grp) if chosen else "Відписано")
         return
+
+    set_subscription(chat.id, chat.type, grp)
 
     # група: перетворюємо повідомлення на меню налаштувань і надсилаємо свіжий графік
     text, kb = settings_view(chat.id, False)
@@ -1541,6 +1789,8 @@ def settings_view(chat_id: int, is_private: bool) -> tuple[str, InlineKeyboardMa
             "ℹ️ Нагадування про вимкнення працюють для конкретної черги — обери її кнопкою нижче.",
             "",
         ]
+    elif is_private:
+        lines += ["📍 Черги: <b>" + ", ".join(get_chat_groups(chat_id) or [sub[1]]) + "</b>", ""]
     else:
         lines += [f"📍 Черга: <b>{sub[1]}</b>", ""]
 
@@ -1550,7 +1800,7 @@ def settings_view(chat_id: int, is_private: bool) -> tuple[str, InlineKeyboardMa
     lines.append("<i>Оновлення графіка приходять завжди.</i>")
 
     kb = [[InlineKeyboardButton(
-        text="🔁 Змінити чергу" if sub else "➕ Обрати чергу", callback_data="cfg:queue"
+        text="🔁 Змінити черги" if sub else "➕ Обрати черги", callback_data="cfg:queue"
     )]]
     kb.append([InlineKeyboardButton(
         text="⏳ Вимкнення: так ✅" if cfg["notify"] else "⏳ Вимкнення: ні ❌", callback_data="cfg:notify"
@@ -1592,9 +1842,12 @@ async def show_now(chat_id: int, is_private: bool):
         return
     grp = sub[1]
     if is_private and grp in GROUPS:
-        saved = get_saved_schedule(grp)
-        text = format_personal_message(grp, saved, is_update=False) if saved else "Дані ще завантажуються, спробуй за хвилину."
-        await bot.send_message(chat_id, text, parse_mode="HTML")
+        blocks = [
+            format_personal_message(g, get_saved_schedule(g), is_update=False)
+            for g in get_chat_groups(chat_id) if get_saved_schedule(g)
+        ]
+        text = "\n\n".join(blocks) if blocks else "Дані ще завантажуються, спробуй за хвилину."
+        await bot.send_message(chat_id, text[:4000], parse_mode="HTML")
     elif USE_IMAGES and get_all_saved():
         if not await send_overview(chat_id, focus=grp if grp in GROUPS else None):
             await bot.send_message(chat_id, "Актуального графіка на сьогодні чи завтра ще немає на сайті ЛОЕ.")
@@ -1644,7 +1897,7 @@ async def cb_settings(callback: types.CallbackQuery):
         try:
             await msg.edit_text(
                 PICK_TEXT_PRIVATE if is_private else PICK_TEXT_GROUP,
-                reply_markup=get_groups_keyboard(is_private, current=current_group(chat.id), back=True),
+                reply_markup=get_groups_keyboard(is_private, current=current_groups(chat.id, is_private), back=True),
                 parse_mode="HTML",
             )
         except TelegramBadRequest:
@@ -1762,7 +2015,11 @@ async def cmd_now(message: types.Message):
         return
 
     if chat_type == "private":
-        await message.answer(format_personal_message(grp, saved, is_update=False), parse_mode="HTML")
+        blocks = [
+            format_personal_message(g, get_saved_schedule(g), is_update=False)
+            for g in get_chat_groups(message.chat.id) if get_saved_schedule(g)
+        ]
+        await message.answer("\n\n".join(blocks)[:4000], parse_mode="HTML")
     else:
         await send_overview(message.chat.id, focus=grp)
         await message.answer(format_chat_message(grp, saved, is_update=False), parse_mode="HTML")
@@ -1802,9 +2059,11 @@ async def show_day(message: types.Message, offset: int):
     grp = sub[1] if sub else None
     if sub and sub[0] == "private" and grp in snapshot:
         heading = "☀️ <b>Графік на сьогодні</b>" if offset == 0 else "🌙 <b>Графік на завтра</b>"
-        await message.answer(
-            format_day_text(grp, snapshot[grp], day, f"{heading} · черга <b>{grp}</b>"), parse_mode="HTML"
-        )
+        for g in get_chat_groups(message.chat.id):
+            if g in snapshot:
+                await message.answer(
+                    format_day_text(g, snapshot[g], day, f"{heading} · черга <b>{g}</b>"), parse_mode="HTML"
+                )
         return
 
     if not USE_IMAGES:
@@ -1896,8 +2155,13 @@ async def cmd_next(message: types.Message):
         await message.answer("Дані ще завантажуються, спробуй за хвилину.")
         return
 
-    text = next_outage_text(grp, saved)
-    await message.answer(text or "✅ Найближчим часом вимкнень не заплановано.", parse_mode="HTML")
+    groups = get_chat_groups(message.chat.id) if message.chat.type == "private" else [grp]
+    out = []
+    for g in groups:
+        s = get_saved_schedule(g)
+        t = next_outage_text(g, s) if s else None
+        out.append((f"<b>Черга {g}</b>\n" if len(groups) > 1 else "") + (t or "✅ Найближчим часом вимкнень не заплановано."))
+    await message.answer("\n\n".join(out), parse_mode="HTML")
 
 
 @dp.message(Command("stop"))
@@ -1913,12 +2177,53 @@ async def cmd_stop(message: types.Message):
         await message.answer("Цей чат ще не підписаний на жодну чергу.")
 
 
+# ---------------------------------------------------------------- Команди власника
+
+def is_owner(message: types.Message) -> bool:
+    return bool(OWNER_ID) and message.chat.type == "private" and bool(message.from_user) and message.from_user.id == OWNER_ID
+
+
+@dp.message(Command("backup"))
+async def cmd_backup(message: types.Message):
+    if not is_owner(message):
+        return
+    if not BACKUP_ENABLED:
+        await message.answer("Бекап вимкнено (потрібен OWNER_ID і BACKUP=1).")
+        return
+    ok = await send_backup("вручну")
+    if not ok:
+        await message.answer("Не вдалось зробити бекап, дивись лог.")
+
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message):
+    """/broadcast текст — розсилка всім підписаним чатам (лише власнику)."""
+    if not is_owner(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Використання: <code>/broadcast текст повідомлення</code>", parse_mode="HTML")
+        return
+    text = "📢 " + html.escape(parts[1].strip())
+    with db() as conn:
+        chat_ids = [r[0] for r in conn.execute("SELECT chat_id FROM subscribers").fetchall()]
+    sent = 0
+    for chat_id in chat_ids:
+        if await safe_send(chat_id, text):
+            sent += 1
+        await asyncio.sleep(0.1)
+    await message.answer(f"Розіслано: {sent} з {len(chat_ids)} чатів.")
+
+
 # ---------------------------------------------------------------- Main
 
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задано BOT_TOKEN! Створи файл .env поруч із bot.py: BOT_TOKEN=твій_токен")
 
+    restored = await restore_from_backup()
+    if not BACKUP_ENABLED:
+        logging.warning("Бекап бази вимкнено: задай OWNER_ID, щоб підписки переживали перезапуски на хостингу без диска.")
     init_db()
     logging.info(f"Бот запущено. Перевірка ЛОЕ кожні {CHECK_INTERVAL}с, звіт у лог раз на {HEARTBEAT_MINUTES} хв.")
     try:  # меню «/» у Telegram
@@ -1927,10 +2232,14 @@ async def main():
         logging.warning(f"Не вдалось встановити меню команд: {e}")
     priv, grp = count_subscribers()
     logging.info(f"У базі підписано чатів: {priv} особистих, {grp} групових (DB_PATH={DB_PATH})")
-    await notify_owner(f"🚀 Бот запущено. Підписано: {priv} особистих, {grp} групових чатів.")
+    await notify_owner(
+        ("♻️ Базу відновлено з бекапу. " if restored else "")
+        + f"🚀 Бот запущено. Підписано: {priv} особистих, {grp} групових чатів."
+    )
     monitor_task = asyncio.create_task(monitor_loop())
     reminders_task = asyncio.create_task(reminders_loop())
     digest_task = asyncio.create_task(digest_loop())
+    backup_task = asyncio.create_task(backup_loop())
     health_task = asyncio.create_task(health_server()) if PORT else None
 
     try:
@@ -1951,7 +2260,8 @@ async def main():
         monitor_task.cancel()
         reminders_task.cancel()
         digest_task.cancel()
-        tasks = [monitor_task, reminders_task, digest_task]
+        backup_task.cancel()
+        tasks = [monitor_task, reminders_task, digest_task, backup_task]
         if health_task:
             health_task.cancel()
             tasks.append(health_task)
